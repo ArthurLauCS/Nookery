@@ -1,0 +1,75 @@
+# DeskTiles
+
+Windows 11 桌面磁贴。桌面上的散文件（文件夹、文档、图片等）会自动按类型收进对应的磁贴，快捷方式留在桌面不动。单个 283 KB 的 exe，常驻私有内存 12~14 MB，空闲时 CPU 为 0。
+
+调研、方案对比和实测数据见 [docs/调研与方案.md](docs/调研与方案.md)。
+
+## 构建
+
+```bash
+cargo build --release
+```
+
+产物在 `target/release/desktiles.exe`，需要 Rust 工具链和 MSVC 生成工具。
+
+## 文件放在哪
+
+- 归进磁贴的文件实际移到 `桌面\.DeskTiles\<磁贴名>\`。这个目录带隐藏和系统属性，路径会变，文件仍在桌面目录下，OneDrive 桌面同步照常生效。
+- 配置（磁贴位置、规则、暂停状态）在 `%APPDATA%\DeskTiles\config.txt`。
+- 在 `.DeskTiles` 里手动建一个文件夹，它也会变成一块磁贴。
+- 卸载前在托盘菜单里点“全部还原到桌面”。
+
+## 归类规则
+
+| 磁贴 | 内容 |
+|---|---|
+| 文件夹 | 目录 |
+| 文档 | doc docx pdf txt md rtf odt xls xlsx csv ppt pptx wps et dps |
+| 图片 | png jpg jpeg gif webp bmp svg heic ico psd |
+| 视频 | mp4 mkv mov avi wmv flv webm |
+| 音频 | mp3 wav flac aac m4a ogg |
+| 压缩包 | zip rar 7z tar gz |
+| 程序 | exe msi |
+| 其他 | 以上都不是的 |
+
+不归类、留在桌面的：
+
+- 快捷方式（`.lnk` `.url` `.appref-ms` `.website`）
+- 隐藏文件和系统文件
+- 下载中的临时文件（`.crdownload` `.part` 等）
+- Office 锁文件（`~$` 开头）
+
+文件要 3 秒内没有改动、能独占打开才会移走；你正在桌面上给图标改名时也不移。
+
+把某种文件从一块磁贴拖到另一块，会问你以后这种扩展名是否都放进新磁贴。
+
+## 操作
+
+| 操作 | 效果 |
+|---|---|
+| 双击文件 / Enter | 打开 |
+| 右键文件 | 系统右键菜单 |
+| F2 | 改名 |
+| Delete（Shift+Delete） | 删到回收站（彻底删除） |
+| Ctrl+A / C / X / V | 全选 / 复制 / 剪切 / 粘贴 |
+| 拖出 / 拖入 | 和资源管理器一样，同盘移动、跨盘复制 |
+| 拖标题栏 | 移动，靠近屏幕边缘或其他磁贴时自动吸附 |
+| 拖边缘 | 改尺寸 |
+| 双击标题栏 | 折叠 / 展开 |
+| 右键标题栏或空白处 | 重命名、折叠、打开所在文件夹、粘贴、新建磁贴、删除磁贴 |
+| 左键单击托盘图标 | 隐藏 / 显示全部磁贴 |
+| 右键托盘图标 | 新建磁贴、暂停自动归类、全部还原到桌面、开机自启、退出 |
+
+## 测试
+
+```bash
+cargo test
+```
+
+`scripts/` 下是用假桌面做的端到端测试，不会碰真实桌面：
+
+- `setup.ps1`：在 `C:\WorkFile\Temp\fakedesk` 造一批测试文件；加 `-Bulk 200` 再多造 200 个。
+- `run.ps1`：用 `--root` 指向假桌面启动，检查归类结果、内存和 CPU，并截图。
+- `interact.ps1`：借助 `examples/drive.rs` 给磁贴窗口发消息，测选中、F2 改名和折叠。
+
+`--root <目录>` 用指定目录代替桌面，配置也存进那个目录；`--top` 让磁贴置顶，便于截图。
