@@ -3,6 +3,7 @@
 //!
 //! 参数：--root <目录> 用指定目录代替桌面（测试用，配置也放进该目录）；--top 磁贴置顶（截图走查用）。
 
+mod drop;
 mod gfx;
 mod rules;
 mod shell;
@@ -18,6 +19,7 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::*;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Ole::OleInitialize;
@@ -73,6 +75,8 @@ pub struct App {
     pub topmost: bool,
     /// 系统右键菜单弹出期间，用来转发子菜单的绘制消息
     pub menu2: Option<IContextMenu2>,
+    /// 拖进磁贴时显示系统拖拽缩略图
+    pub drop_helper: Option<IDropTargetHelper>,
     taskbar_created: u32,
 }
 
@@ -93,7 +97,7 @@ fn reg_dword(key: PCWSTR, name: PCWSTR) -> Option<u32> {
     (r == ERROR_SUCCESS).then_some(v)
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
@@ -119,6 +123,15 @@ fn list_dir(dir: &Path) -> Vec<(String, bool, SystemTime)> {
         })
     });
     v
+}
+
+/// 销毁磁贴窗口；之后它的窗口过程不再碰这块磁贴
+fn destroy(t: &Tile) {
+    unsafe {
+        let _ = windows::Win32::System::Ole::RevokeDragDrop(t.hwnd);
+        SetWindowLongPtrW(t.hwnd, GWLP_USERDATA, 0);
+        let _ = DestroyWindow(t.hwnd);
+    }
 }
 
 /// 弹出简单菜单，id 为 0 的项是分隔线；返回选中的 id，没选返回 0
@@ -191,13 +204,21 @@ impl App {
             if shell::label_editing() {
                 wait = true;
             } else {
+                let mut seen = Vec::new();
                 for e in std::fs::read_dir(&self.root).into_iter().flatten().flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
                     let Ok(md) = e.metadata() else { continue };
-                    if name == DATA_DIR {
+                    seen.push(name.clone());
+                    if name == DATA_DIR || self.cfg.keep.contains(&name) {
                         continue;
                     }
                     let Some(tile) = rules::classify(&self.cfg, &name, md.is_dir(), is_hidden(&md)).map(str::to_string) else { continue };
+                    // 刚从磁贴拖回桌面的（磁贴列表里还有它、目录里已经没了）：用户特意放的，留在桌面
+                    if self.tiles.iter().any(|t| t.items.iter().any(|it| it.name == name) && !self.data.join(&t.name).join(&name).exists()) {
+                        self.cfg.keep.push(name);
+                        self.save();
+                        continue;
+                    }
                     let path = e.path();
                     if !shell::is_stable(&path, &md) {
                         wait = true;
@@ -210,6 +231,12 @@ impl App {
                     let _ = std::fs::create_dir_all(&dir);
                     // 失败多半是文件正被占用，稍后再试
                     wait |= !shell::move_unique(&path, &dir);
+                }
+                // 留在桌面的项被删掉或改名后，记录跟着清掉
+                let before = self.cfg.keep.len();
+                self.cfg.keep.retain(|k| seen.contains(k));
+                if self.cfg.keep.len() != before {
+                    self.save();
                 }
             }
         }
@@ -384,25 +411,12 @@ impl App {
         }
         let _ = std::fs::remove_dir(&dir);
         if let Some(k) = self.tiles.iter().position(|t| t.name == name) {
-            let t = self.tiles.remove(k);
-            unsafe {
-                SetWindowLongPtrW(t.hwnd, GWLP_USERDATA, 0);
-                let _ = DestroyWindow(t.hwnd);
-            }
+            destroy(&self.tiles.remove(k));
         }
         self.save();
     }
 
-    pub fn drop_into(&mut self, t: &mut Tile, hdrop: HDROP) {
-        let mut files = Vec::new();
-        unsafe {
-            for i in 0..DragQueryFileW(hdrop, u32::MAX, None) {
-                let mut buf = vec![0u16; DragQueryFileW(hdrop, i, None) as usize + 1];
-                let n = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
-                files.push(PathBuf::from(String::from_utf16_lossy(&buf[..n])));
-            }
-            DragFinish(hdrop);
-        }
+    pub fn drop_into(&mut self, t: &mut Tile, mut files: Vec<PathBuf>, copy: bool) {
         let dir = t.dir(self);
         files.retain(|f| !f.parent().is_some_and(|p| same_path(p, &dir)));
         if files.is_empty() {
@@ -413,7 +427,7 @@ impl App {
         let from_tiles = files.iter().all(|f| !f.is_dir() && f.parent().and_then(Path::parent).is_some_and(|p| same_path(p, &self.data)));
         let ext = rules::ext_of(&files[0].to_string_lossy());
         let one_ext = !ext.is_empty() && files.iter().all(|f| rules::ext_of(&f.to_string_lossy()) == ext);
-        shell::drop_files(t.hwnd, &files, &dir);
+        shell::drop_files(t.hwnd, &files, &dir, copy);
         if from_tiles && one_ext && self.cfg.tile_for(&ext) != Some(t.name.as_str()) {
             let msg = shell::wide(&format!("以后 .{ext} 文件都自动放进「{}」？", t.name));
             if unsafe { MessageBoxW(Some(t.hwnd), PCWSTR(msg.as_ptr()), w!("DeskTiles"), MB_YESNO | MB_ICONQUESTION) } == IDYES {
@@ -674,6 +688,7 @@ fn main() {
             hidden: false,
             topmost: args.iter().any(|a| a == "--top"),
             menu2: None,
+            drop_helper: CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).ok(),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         });
         a.load_theme();

@@ -57,6 +57,8 @@ pub struct Tile {
     press: Option<(POINT, usize)>,
     /// 改名编辑框；Some(文件名) 改文件，None 改磁贴名
     edit: Option<(HWND, Option<String>)>,
+    /// 有文件正拖在上面
+    pub drop_hot: bool,
 }
 
 fn rect(l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {
@@ -103,11 +105,12 @@ impl Tile {
             anchor: 0,
             press: None,
             edit: None,
+            drop_hot: false,
         });
         unsafe {
             let title = shell::wide(name);
             t.hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_ACCEPTFILES | WS_EX_NOREDIRECTIONBITMAP,
+                WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
                 crate::TILE_CLASS,
                 PCWSTR(title.as_ptr()),
                 WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN,
@@ -122,6 +125,7 @@ impl Tile {
             )
             .expect("创建磁贴窗口失败");
             SetWindowLongPtrW(t.hwnd, GWLP_USERDATA, &mut *t as *mut Tile as isize);
+            crate::drop::register(&mut t);
             if rolled {
                 let _ = SetWindowPos(t.hwnd, None, 0, 0, r[2], (TITLE_H * scale(t.hwnd)) as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
@@ -359,6 +363,13 @@ impl Tile {
                         br,
                     );
                 }
+            }
+            if self.drop_hot {
+                let edge = D2D1_ROUNDED_RECT { rect: rect(1.0, 1.0, w - 1.0, h - 1.0), radiusX: 7.0, radiusY: 7.0 };
+                br.SetColor(&D2D1_COLOR_F { a: 0.12, ..th.sel_line });
+                rt.FillRoundedRectangle(&edge, br);
+                br.SetColor(&th.sel_line);
+                rt.DrawRoundedRectangle(&edge, br, 2.0, None);
             }
             let ok = rt.EndDraw(None, None).is_ok();
             if !(a.gfx.present(&surf).is_ok() && ok) {
@@ -740,7 +751,6 @@ pub unsafe extern "system" fn tile_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 t.invalidate();
             }
             WM_KEYDOWN => t.on_key(a, wp.0 as u16),
-            WM_DROPFILES => a.drop_into(t, HDROP(wp.0 as _)),
             _ => return DefWindowProcW(hwnd, msg, wp, lp),
         }
         LRESULT(0)

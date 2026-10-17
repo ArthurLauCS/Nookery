@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+windows-core = "0.62"
 windows-numerics = "0.3"
 
 [dependencies.windows]
@@ -23,6 +24,7 @@ features = [
     "Win32_Graphics_Imaging",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",

@@ -89,29 +89,32 @@ pub fn move_unique(src: &Path, dir: &Path) -> bool {
     false
 }
 
-/// 拖进来的文件：同盘移动，跨盘复制（和资源管理器的默认行为一致）
-pub fn drop_files(hwnd: HWND, files: &[PathBuf], dir: &Path) {
-    let same_volume = |p: &PathBuf| p.components().next() == dir.components().next();
-    for (mv, op) in [(true, FO_MOVE), (false, FO_COPY)] {
-        let mut from: Vec<u16> = Vec::new();
-        for f in files.iter().filter(|f| same_volume(f) == mv) {
-            from.extend(wpath(f));
-        }
-        if from.is_empty() {
-            continue;
-        }
-        from.push(0);
-        let to = wpath(dir);
-        let mut op = SHFILEOPSTRUCTW {
-            hwnd,
-            wFunc: op,
-            pFrom: PCWSTR(from.as_ptr()),
-            pTo: PCWSTR(to.as_ptr()),
-            fFlags: FOF_ALLOWUNDO.0 as u16,
-            ..Default::default()
-        };
-        unsafe { SHFileOperationW(&mut op) };
+pub fn hdrop_paths(hdrop: HDROP) -> Vec<PathBuf> {
+    unsafe {
+        (0..DragQueryFileW(hdrop, u32::MAX, None))
+            .map(|i| {
+                let mut buf = vec![0u16; DragQueryFileW(hdrop, i, None) as usize + 1];
+                let n = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
+                PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+            })
+            .collect()
     }
+}
+
+/// 拖进来的文件移动或复制进 dir；重名时由系统弹窗询问
+pub fn drop_files(hwnd: HWND, files: &[PathBuf], dir: &Path, copy: bool) {
+    let mut from: Vec<u16> = files.iter().flat_map(|f| wpath(f)).collect();
+    from.push(0);
+    let to = wpath(dir);
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd,
+        wFunc: if copy { FO_COPY } else { FO_MOVE },
+        pFrom: PCWSTR(from.as_ptr()),
+        pTo: PCWSTR(to.as_ptr()),
+        fFlags: FOF_ALLOWUNDO.0 as u16,
+        ..Default::default()
+    };
+    unsafe { SHFileOperationW(&mut op) };
 }
 
 pub fn open(path: &Path) {
