@@ -2,6 +2,8 @@
 
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU32};
 use std::time::{Duration, SystemTime};
 
 use windows::Win32::Foundation::*;
@@ -18,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
 pub const WM_APP_FS: u32 = WM_APP + 1;
+pub const WM_APP_DBLCLK: u32 = WM_APP + 3;
 
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -36,8 +39,8 @@ pub fn desktop_dir() -> PathBuf {
     }
 }
 
-/// 用户正在桌面上给图标改名（列表里有编辑框）时不归类，否则“新建文件夹”还没起好名字就被拿走了
-pub fn label_editing() -> bool {
+/// 桌面图标所在的列表控件
+fn desktop_listview() -> Option<HWND> {
     unsafe {
         let def = FindWindowW(w!("Progman"), PCWSTR::null())
             .ok()
@@ -52,10 +55,24 @@ pub fn label_editing() -> bool {
                     }
                 }
             });
-        let Some(lv) = def.and_then(|d| FindWindowExW(Some(d), None, w!("SysListView32"), PCWSTR::null()).ok()) else {
-            return false;
-        };
-        FindWindowExW(Some(lv), None, w!("Edit"), PCWSTR::null()).is_ok()
+        FindWindowExW(def, None, w!("SysListView32"), PCWSTR::null()).ok()
+    }
+}
+
+/// 用户正在桌面上给图标改名（列表里有编辑框）时不归类，否则“新建文件夹”还没起好名字就被拿走了
+pub fn label_editing() -> bool {
+    desktop_listview().is_some_and(|lv| unsafe { FindWindowExW(Some(lv), None, w!("Edit"), PCWSTR::null()).is_ok() })
+}
+
+/// 这一点是不是桌面空白处：点在桌面图标列表上，且没有选中任何图标（点空白会清空选中）
+pub fn desktop_blank_at(pt: POINT) -> bool {
+    const LVM_GETSELECTEDCOUNT: u32 = 0x1032;
+    let Some(lv) = desktop_listview() else { return false };
+    let mut n = 1usize;
+    unsafe {
+        WindowFromPoint(pt) == lv
+            && SendMessageTimeoutW(lv, LVM_GETSELECTEDCOUNT, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 200, Some(&mut n)).0 != 0
+            && n == 0
     }
 }
 
@@ -305,4 +322,54 @@ pub fn watch(root: PathBuf, notify: HWND) {
             let _ = PostMessageW(Some(HWND(notify as _)), WM_APP_FS, WPARAM(0), LPARAM(0));
         }
     });
+}
+
+static DBL_NOTIFY: AtomicIsize = AtomicIsize::new(0);
+static DBL_TIME: AtomicU32 = AtomicU32::new(0);
+static DBL_X: AtomicI32 = AtomicI32::new(i32::MIN);
+static DBL_Y: AtomicI32 = AtomicI32::new(0);
+
+/// 全局鼠标钩子只看左键抬起，两次抬起落在系统双击时间和范围内就通知主窗口。
+/// 钩子单独开线程：主线程取图标时会卡上百毫秒，钩子跑在主线程会拖慢全系统的鼠标
+unsafe extern "system" fn mouse_ll(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        if code >= 0 && wp.0 as u32 == WM_LBUTTONUP {
+            let m = &*(lp.0 as *const MSLLHOOKSTRUCT);
+            let (dx, dy) = (GetSystemMetrics(SM_CXDOUBLECLK) / 2, GetSystemMetrics(SM_CYDOUBLECLK) / 2);
+            let quick = m.time.wrapping_sub(DBL_TIME.load(Relaxed)) <= windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime();
+            let near = (m.pt.x - DBL_X.load(Relaxed)).abs() <= dx && (m.pt.y - DBL_Y.load(Relaxed)).abs() <= dy;
+            if quick && near {
+                DBL_X.store(i32::MIN, Relaxed);
+                let lp = ((m.pt.y as isize) << 32) | (m.pt.x as u32 as isize);
+                let _ = PostMessageW(Some(HWND(DBL_NOTIFY.load(Relaxed) as _)), WM_APP_DBLCLK, WPARAM(0), LPARAM(lp));
+            } else {
+                DBL_TIME.store(m.time, Relaxed);
+                DBL_X.store(m.pt.x, Relaxed);
+                DBL_Y.store(m.pt.y, Relaxed);
+            }
+        }
+        CallNextHookEx(None, code, wp, lp)
+    }
+}
+
+/// 开始监听双击，返回钩子线程 id（停用时传给 stop_thread）
+pub fn watch_dblclick(notify: HWND) -> u32 {
+    DBL_NOTIFY.store(notify.0 as isize, Relaxed);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || unsafe {
+        let _ = tx.send(windows::Win32::System::Threading::GetCurrentThreadId());
+        let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll), None, 0);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+        if let Ok(h) = hook {
+            let _ = UnhookWindowsHookEx(h);
+        }
+    });
+    rx.recv().unwrap_or(0)
+}
+
+pub fn stop_thread(tid: u32) {
+    unsafe {
+        let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+    }
 }

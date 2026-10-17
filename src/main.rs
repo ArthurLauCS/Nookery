@@ -77,6 +77,8 @@ pub struct App {
     pub menu2: Option<IContextMenu2>,
     /// 拖进磁贴时显示系统拖拽缩略图
     pub drop_helper: Option<IDropTargetHelper>,
+    /// 双击桌面监听线程
+    dbl_thread: u32,
     taskbar_created: u32,
 }
 
@@ -416,6 +418,25 @@ impl App {
         self.save();
     }
 
+    /// 资源管理器重启后桌面窗口换了一个，磁贴（以旧桌面为所有者）会被系统连带销毁：全部重建
+    fn rebuild_tiles(&mut self) {
+        self.owner = unsafe { FindWindowW(w!("Progman"), PCWSTR::null()) }.ok();
+        for t in self.tiles.drain(..) {
+            destroy(&t);
+        }
+        self.sync_tiles();
+    }
+
+    fn set_dblclick(&mut self, on: bool) {
+        if self.dbl_thread != 0 {
+            shell::stop_thread(self.dbl_thread);
+            self.dbl_thread = 0;
+        }
+        if on {
+            self.dbl_thread = shell::watch_dblclick(self.main);
+        }
+    }
+
     pub fn drop_into(&mut self, t: &mut Tile, mut files: Vec<PathBuf>, copy: bool) {
         let dir = t.dir(self);
         files.retain(|f| !f.parent().is_some_and(|p| same_path(p, &dir)));
@@ -496,7 +517,8 @@ impl App {
         }
         let check = |on: bool, s: &'static str| if on { format!("✓{s}") } else { s.to_string() };
         let (paused, auto, hidden) = (check(self.cfg.paused, "暂停自动归类"), check(self.autostart(), "开机自启"), check(self.hidden, "隐藏磁贴"));
-        let items = [(1, "新建磁贴"), (6, hidden.as_str()), (2, paused.as_str()), (0, ""), (3, "全部还原到桌面"), (4, auto.as_str()), (0, ""), (5, "退出")];
+        let dbl = check(self.cfg.dblclick, "双击桌面空白处隐藏磁贴");
+        let items = [(1, "新建磁贴"), (6, hidden.as_str()), (7, dbl.as_str()), (2, paused.as_str()), (0, ""), (3, "全部还原到桌面"), (4, auto.as_str()), (0, ""), (5, "退出")];
         match popup(self.main, pt, &items) {
             1 => self.new_tile(),
             2 => {
@@ -518,6 +540,11 @@ impl App {
                 let _ = DestroyWindow(self.main);
             },
             6 => self.set_hidden(!self.hidden),
+            7 => {
+                self.cfg.dblclick = !self.cfg.dblclick;
+                self.set_dblclick(self.cfg.dblclick);
+                self.save();
+            }
             _ => {}
         }
     }
@@ -575,7 +602,16 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             WM_DISPLAYCHANGE => a.clamp_tiles(),
             WM_DESTROY => PostQuitMessage(0),
-            m if m == a.taskbar_created => a.tray(NIM_ADD),
+            shell::WM_APP_DBLCLK => {
+                let pt = POINT { x: lp.0 as i32, y: (lp.0 >> 32) as i32 };
+                if shell::desktop_blank_at(pt) {
+                    a.set_hidden(!a.hidden);
+                }
+            }
+            m if m == a.taskbar_created => {
+                a.tray(NIM_ADD);
+                a.rebuild_tiles();
+            }
             _ => return DefWindowProcW(hwnd, msg, wp, lp),
         }
         LRESULT(0)
@@ -689,11 +725,31 @@ fn main() {
             topmost: args.iter().any(|a| a == "--top"),
             menu2: None,
             drop_helper: CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).ok(),
+            dbl_thread: 0,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         });
         a.load_theme();
         APP = &mut *a;
         a.tray(NIM_ADD);
+        // 第一次在真实桌面上运行：先说清楚要动多少项，确认后再整理
+        if test_root.is_none() && !a.cfg_path.exists() {
+            let n = std::fs::read_dir(&a.root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name() != DATA_DIR && e.metadata().is_ok_and(|m| rules::classify(&a.cfg, &e.file_name().to_string_lossy(), m.is_dir(), is_hidden(&m)).is_some()))
+                .count();
+            let msg = shell::wide(&format!(
+                "DeskTiles 会把桌面上 {n} 个散文件和文件夹按类型收进磁贴，快捷方式不动。\n随时可以在托盘菜单里“全部还原到桌面”。\n\n现在整理吗？选“否”会先暂停自动归类。"
+            ));
+            if n > 0 && MessageBoxW(Some(main), PCWSTR(msg.as_ptr()), w!("DeskTiles"), MB_YESNO | MB_ICONQUESTION) != IDYES {
+                a.cfg.paused = true;
+            }
+            a.save();
+        }
+        if a.cfg.dblclick {
+            a.set_dblclick(true);
+        }
         shell::watch(root, main);
         a.rescan();
 

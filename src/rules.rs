@@ -35,6 +35,8 @@ pub struct Config {
     /// (扩展名或 FOLDER_KEY / FALLBACK_KEY, 磁贴名)
     pub rules: Vec<(String, String)>,
     pub paused: bool,
+    /// 双击桌面空白处隐藏 / 显示磁贴
+    pub dblclick: bool,
     /// 用户从磁贴拖回桌面的项，留在桌面不再收回
     pub keep: Vec<String>,
 }
@@ -42,11 +44,12 @@ pub struct Config {
 impl Config {
     /// 空文本得到默认配置
     pub fn parse(text: &str) -> Config {
-        let mut cfg = Config { tiles: Vec::new(), rules: Vec::new(), paused: false, keep: Vec::new() };
+        let mut cfg = Config { tiles: Vec::new(), rules: Vec::new(), paused: false, dblclick: true, keep: Vec::new() };
         for line in text.lines() {
             let f: Vec<&str> = line.split('|').collect();
             match f.as_slice() {
                 ["paused", v] => cfg.paused = *v == "1",
+                ["dblclick", v] => cfg.dblclick = *v == "1",
                 ["keep", name] => cfg.keep.push(name.to_string()),
                 ["rule", key, tile] => cfg.rules.push((key.to_string(), tile.to_string())),
                 ["tile", name, x, y, w, h, rolled, keep] => cfg.tiles.push(TileCfg {
@@ -68,7 +71,7 @@ impl Config {
     }
 
     pub fn to_text(&self) -> String {
-        let mut s = format!("paused|{}\n", self.paused as u8);
+        let mut s = format!("paused|{}\ndblclick|{}\n", self.paused as u8, self.dblclick as u8);
         for t in &self.tiles {
             let [x, y, w, h] = t.rect;
             s += &format!("tile|{}|{x}|{y}|{w}|{h}|{}|{}\n", t.name, t.rolled as u8, t.keep as u8);
@@ -143,11 +146,13 @@ mod tests {
         cfg.tiles[1].rect = [10, 20, 300, 200];
         cfg.tiles[1].rolled = true;
         cfg.paused = true;
+        cfg.dblclick = false;
         cfg.keep.push("放在桌面.docx".into());
         let back = Config::parse(&cfg.to_text());
         assert_eq!(classify(&back, "说明.pdf", false, false), Some("图片"));
         assert_eq!(back.tiles[1].rect, [10, 20, 300, 200]);
-        assert!(back.tiles[1].rolled && back.paused);
+        assert!(back.tiles[1].rolled && back.paused && !back.dblclick);
+        assert!(Config::parse("").dblclick);
         assert_eq!(back.keep, ["放在桌面.docx"]);
         assert_eq!(back.tiles.len(), 8);
     }
