@@ -23,13 +23,19 @@ use crate::gfx::Surface;
 use crate::shell::{self, Items, Picked};
 use crate::{App, app, popup};
 
-pub const TITLE_H: f32 = 34.0;
+// 间距都在 4 / 8 的格子上；字号只有两档（12 / 14，1.2 比例），在 main.rs 的字体里
+pub const TITLE_H: f32 = 36.0;
 pub const PAD: f32 = 8.0;
 const CELL_W: f32 = 84.0;
-pub const CELL_H: f32 = 86.0;
+pub const CELL_H: f32 = 88.0;
 const ICON: f32 = 40.0;
+/// 图标下沿到文件名的距离
+const GAP: f32 = 8.0;
 const LABEL_H: f32 = 32.0;
+const TITLE_ICON: f32 = 16.0;
+const RADIUS: f32 = 6.0;
 const EDGE: f32 = 6.0;
+const MIN_W: f32 = 120.0;
 
 pub struct Item {
     pub name: String,
@@ -59,6 +65,12 @@ pub struct Tile {
     edit: Option<(HWND, Option<String>)>,
     /// 有文件正拖在上面
     pub drop_hot: bool,
+    /// 标题栏上这一类文件的原版图标
+    title_icon: Option<ID2D1Bitmap>,
+    title_icon_tried: bool,
+    /// 键盘焦点所在项；kbd 为真时画焦点环（用键盘操作过、还没再点鼠标）
+    focus: usize,
+    kbd: bool,
 }
 
 fn rect(l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {
@@ -106,6 +118,10 @@ impl Tile {
             press: None,
             edit: None,
             drop_hot: false,
+            title_icon: None,
+            title_icon_tried: false,
+            focus: 0,
+            kbd: false,
         });
         unsafe {
             let title = shell::wide(name);
@@ -252,6 +268,8 @@ impl Tile {
 
     pub fn drop_device(&mut self) {
         self.surf = None;
+        self.title_icon = None;
+        self.title_icon_tried = false;
         for it in &mut self.items {
             it.icon = None;
             it.icon_tried = false;
@@ -270,6 +288,14 @@ impl Tile {
         self.painting = true;
         let (w, h) = self.size_dip();
         let (s, dir) = (scale(self.hwnd), self.dir(a));
+        if !self.title_icon_tried {
+            self.title_icon_tried = true;
+            let px = (TITLE_ICON * s) as i32;
+            self.title_icon = match a.type_icon_name(&self.name) {
+                Some(n) => shell::load_type_icon(&a.gfx.dc, &n, px),
+                None => shell::load_icon(&a.gfx.dc, &dir, px),
+            };
+        }
         for i in 0..self.items.len() {
             let r = self.item_rect(i, w);
             let it = &mut self.items[i];
@@ -302,15 +328,19 @@ impl Tile {
             rt.BeginDraw();
             rt.Clear(Some(&th.tint));
 
+            let mut x = 12.0;
+            if let Some(bmp) = &self.title_icon {
+                let y = (TITLE_H - TITLE_ICON) / 2.0;
+                rt.DrawBitmap(bmp, Some(&rect(x, y, x + TITLE_ICON, y + TITLE_ICON)), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                x += TITLE_ICON + PAD;
+            }
             br.SetColor(&th.text);
-            rt.DrawText(&u16s(&self.name), &a.fmt_title, &rect(14.0, 0.0, w - 48.0, TITLE_H), br, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            rt.DrawText(&u16s(&self.name), &a.fmt_title, &rect(x, 0.0, w - 48.0, TITLE_H), br, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
             br.SetColor(&th.muted);
             let count = self.items.len().to_string();
-            rt.DrawText(&u16s(&count), &a.fmt_count, &rect(w - 48.0, 0.0, w - 14.0, TITLE_H), br, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            rt.DrawText(&u16s(&count), &a.fmt_count, &rect(w - 48.0, 0.0, w - 12.0, TITLE_H), br, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
 
             if !self.rolled {
-                br.SetColor(&th.line);
-                rt.FillRectangle(&rect(10.0, TITLE_H - 1.0, w - 10.0, TITLE_H), br);
                 if self.items.is_empty() {
                     br.SetColor(&th.muted);
                     rt.DrawText(&u16s("拖放文件到这里"), &a.fmt_hint, &rect(0.0, TITLE_H, w, h), br, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
@@ -323,9 +353,8 @@ impl Tile {
                     if r.bottom < TITLE_H || r.top > h {
                         continue;
                     }
-                    let cell = D2D1_ROUNDED_RECT { rect: rect(r.left + 2.0, r.top + 2.0, r.right - 2.0, r.bottom - 2.0), radiusX: 6.0, radiusY: 6.0 };
-                    let selected = self.sel.contains(&self.items[i].name);
-                    if selected {
+                    let cell = D2D1_ROUNDED_RECT { rect: rect(r.left + 2.0, r.top + 2.0, r.right - 2.0, r.bottom - 2.0), radiusX: RADIUS, radiusY: RADIUS };
+                    if self.sel.contains(&self.items[i].name) {
                         br.SetColor(&th.sel_fill);
                         rt.FillRoundedRectangle(&cell, br);
                         br.SetColor(&th.sel_line);
@@ -333,6 +362,14 @@ impl Tile {
                     } else if self.hover == Some(i) {
                         br.SetColor(&th.hover);
                         rt.FillRoundedRectangle(&cell, br);
+                    }
+                    if self.press.is_some_and(|p| p.1 == i) {
+                        br.SetColor(&th.press);
+                        rt.FillRoundedRectangle(&cell, br);
+                    }
+                    if self.kbd && self.focus == i {
+                        br.SetColor(&th.text);
+                        rt.DrawRoundedRectangle(&cell, br, 2.0, None);
                     }
                     let it = &mut self.items[i];
                     if let Some(bmp) = &it.icon {
@@ -348,7 +385,7 @@ impl Tile {
                     }
                     if let Some(l) = &it.layout {
                         br.SetColor(&th.text);
-                        rt.DrawTextLayout(Vector2 { X: r.left + 4.0, Y: r.top + 14.0 + ICON }, l, br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                        rt.DrawTextLayout(Vector2 { X: r.left + 4.0, Y: r.top + PAD + ICON + GAP }, l, br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
                     }
                 }
                 rt.PopAxisAlignedClip();
@@ -437,9 +474,11 @@ impl Tile {
                     self.anchor = i;
                 }
                 self.press = Some((p, i));
+                self.focus = i;
             }
             None => self.sel.clear(),
         }
+        self.kbd = false;
         self.invalidate();
     }
 
@@ -499,6 +538,34 @@ impl Tile {
         }
     }
 
+    /// 方向键像资源管理器一样移动选中项，并把它滚进可视区
+    fn move_focus(&mut self, vk: VIRTUAL_KEY) {
+        let n = self.items.len();
+        if n == 0 {
+            return;
+        }
+        let (w, h) = self.size_dip();
+        let (cols, _) = grid(w);
+        let f = self.focus.min(n - 1);
+        self.focus = match vk {
+            VK_LEFT => f.saturating_sub(1),
+            VK_RIGHT => (f + 1).min(n - 1),
+            VK_UP => f.saturating_sub(cols),
+            VK_DOWN => (f + cols).min(n - 1),
+            VK_HOME => 0,
+            _ => n - 1,
+        };
+        self.kbd = true;
+        self.anchor = self.focus;
+        self.sel = vec![self.items[self.focus].name.clone()];
+        let row = (self.focus / cols) as f32 * CELL_H;
+        let view = h - TITLE_H - 2.0 * PAD;
+        // 不用 clamp：磁贴折叠时 view 为负，clamp 的上下界会颠倒而 panic
+        self.scroll = self.scroll.min(row).max(row + CELL_H - view);
+        self.clamp_scroll();
+        self.invalidate();
+    }
+
     fn on_key(&mut self, a: &mut App, vk: u16) {
         let ctrl = key_down(VK_CONTROL);
         match VIRTUAL_KEY(vk) {
@@ -510,6 +577,7 @@ impl Tile {
             VK_DELETE => self.verb(a, "delete"),
             VK_RETURN => self.open_selected(a),
             VK_F5 => a.rescan(),
+            VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END => self.move_focus(VIRTUAL_KEY(vk)),
             VK_A if ctrl => {
                 self.sel = self.items.iter().map(|it| it.name.clone()).collect();
                 self.invalidate();
@@ -577,7 +645,7 @@ impl Tile {
         let (r, text) = match item {
             Some(i) => {
                 let r = self.item_rect(i, w);
-                (rect(r.left, r.top + 10.0 + ICON, r.right, r.top + 10.0 + ICON + 24.0), self.items[i].name.clone())
+                (rect(r.left, r.top + PAD + ICON + GAP - 4.0, r.right, r.top + PAD + ICON + GAP + 20.0), self.items[i].name.clone())
             }
             None => (rect(8.0, 5.0, w - 8.0, TITLE_H - 5.0), self.name.clone()),
         };
@@ -648,8 +716,8 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     }
 }
 
-/// 拖动磁贴时吸附到工作区边缘和其他磁贴的边
-fn snap(a: &App, me: HWND, r: &mut RECT) {
+/// 拖动或拖边缘改尺寸时，吸附到工作区边缘和其他磁贴的边；edge 是 WM_SIZING 的 WMSZ_*，None 表示整体移动
+fn snap(a: &App, me: HWND, r: &mut RECT, edge: Option<u32>) {
     unsafe {
         let s = scale(me);
         let (d, gap) = ((12.0 * s) as i32, (8.0 * s) as i32);
@@ -665,16 +733,33 @@ fn snap(a: &App, me: HWND, r: &mut RECT) {
             yt.extend([o.bottom + gap, o.top]);
             yb.extend([o.top - gap, o.bottom]);
         }
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
-        if let Some(&x) = xl.iter().find(|x| (r.left - **x).abs() <= d) {
-            (r.left, r.right) = (x, x + w);
-        } else if let Some(&x) = xr.iter().find(|x| (r.right - **x).abs() <= d) {
-            (r.left, r.right) = (x - w, x);
+        let near = |v: i32, c: &[i32]| c.iter().copied().find(|x| (v - x).abs() <= d);
+        let Some(e) = edge else {
+            let (w, h) = (r.right - r.left, r.bottom - r.top);
+            if let Some(x) = near(r.left, &xl) {
+                (r.left, r.right) = (x, x + w);
+            } else if let Some(x) = near(r.right, &xr) {
+                (r.left, r.right) = (x - w, x);
+            }
+            if let Some(y) = near(r.top, &yt) {
+                (r.top, r.bottom) = (y, y + h);
+            } else if let Some(y) = near(r.bottom, &yb) {
+                (r.top, r.bottom) = (y - h, y);
+            }
+            return;
+        };
+        // 改尺寸：只吸附正在拖的那几条边
+        if matches!(e, WMSZ_LEFT | WMSZ_TOPLEFT | WMSZ_BOTTOMLEFT) {
+            r.left = near(r.left, &xl).unwrap_or(r.left);
         }
-        if let Some(&y) = yt.iter().find(|y| (r.top - **y).abs() <= d) {
-            (r.top, r.bottom) = (y, y + h);
-        } else if let Some(&y) = yb.iter().find(|y| (r.bottom - **y).abs() <= d) {
-            (r.top, r.bottom) = (y - h, y);
+        if matches!(e, WMSZ_RIGHT | WMSZ_TOPRIGHT | WMSZ_BOTTOMRIGHT) {
+            r.right = near(r.right, &xr).unwrap_or(r.right);
+        }
+        if matches!(e, WMSZ_TOP | WMSZ_TOPLEFT | WMSZ_TOPRIGHT) {
+            r.top = near(r.top, &yt).unwrap_or(r.top);
+        }
+        if matches!(e, WMSZ_BOTTOM | WMSZ_BOTTOMLEFT | WMSZ_BOTTOMRIGHT) {
+            r.bottom = near(r.bottom, &yb).unwrap_or(r.bottom);
         }
     }
 }
@@ -717,6 +802,16 @@ pub unsafe extern "system" fn tile_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 a.save_rect(t);
             }
             WM_NCHITTEST => return t.nc_hit(lp),
+            WM_GETMINMAXINFO => {
+                let mm = &mut *(lp.0 as *mut MINMAXINFO);
+                let s = scale(hwnd);
+                mm.ptMinTrackSize.x = (MIN_W * s) as i32;
+                mm.ptMinTrackSize.y = ((if t.rolled { TITLE_H } else { TITLE_H + CELL_H + 2.0 * PAD }) * s) as i32;
+            }
+            WM_KILLFOCUS => {
+                t.kbd = false;
+                t.invalidate();
+            }
             WM_NCLBUTTONDBLCLK if wp.0 as u32 == HTCAPTION => a.toggle_roll(t),
             WM_NCRBUTTONDOWN if wp.0 as u32 == HTCAPTION => {}
             WM_NCRBUTTONUP if wp.0 as u32 == HTCAPTION => t.tile_menu(a, lparam_pt(lp)),
@@ -728,7 +823,11 @@ pub unsafe extern "system" fn tile_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 }
             }
             WM_MOVING => {
-                snap(a, hwnd, &mut *(lp.0 as *mut RECT));
+                snap(a, hwnd, &mut *(lp.0 as *mut RECT), None);
+                return LRESULT(1);
+            }
+            WM_SIZING => {
+                snap(a, hwnd, &mut *(lp.0 as *mut RECT), Some(wp.0 as u32));
                 return LRESULT(1);
             }
             WM_EXITSIZEMOVE => a.save_rect(t),

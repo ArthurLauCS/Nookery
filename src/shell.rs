@@ -144,7 +144,27 @@ pub fn load_icon(rt: &ID2D1RenderTarget, path: &Path, px: i32) -> Option<ID2D1Bi
     unsafe {
         let p = wpath(path);
         let f: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(p.as_ptr()), None).ok()?;
-        let hbm = f.GetImage(SIZE { cx: px, cy: px }, SIIGBF_RESIZETOFIT).ok()?;
+        to_bitmap(rt, &f, px, SIIGBF_RESIZETOFIT)
+    }
+}
+
+/// 一类文件的原版图标（关联程序的图标），文件不需要存在：用只带路径的简单 PIDL，资源管理器按扩展名取图标
+pub fn load_type_icon(rt: &ID2D1RenderTarget, name: &str, px: i32) -> Option<ID2D1Bitmap> {
+    unsafe {
+        let p = wide(&format!("C:\\{name}"));
+        let pidl = SHSimpleIDListFromPath(PCWSTR(p.as_ptr()));
+        if pidl.is_null() {
+            return None;
+        }
+        let f = SHCreateItemFromIDList::<IShellItemImageFactory>(pidl);
+        ILFree(Some(pidl));
+        to_bitmap(rt, &f.ok()?, px, SIIGBF_ICONONLY)
+    }
+}
+
+fn to_bitmap(rt: &ID2D1RenderTarget, f: &IShellItemImageFactory, px: i32, flags: SIIGBF) -> Option<ID2D1Bitmap> {
+    unsafe {
+        let hbm = f.GetImage(SIZE { cx: px, cy: px }, flags).ok()?;
         let mut ds = DIBSECTION::default();
         let got = GetObjectW(hbm.into(), size_of::<DIBSECTION>() as i32, Some(&mut ds as *mut _ as _));
         let bm = ds.dsBm;

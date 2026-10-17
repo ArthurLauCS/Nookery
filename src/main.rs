@@ -47,7 +47,7 @@ pub struct Theme {
     pub text: D2D1_COLOR_F,
     pub muted: D2D1_COLOR_F,
     pub hover: D2D1_COLOR_F,
-    pub line: D2D1_COLOR_F,
+    pub press: D2D1_COLOR_F,
     pub sel_fill: D2D1_COLOR_F,
     pub sel_line: D2D1_COLOR_F,
 }
@@ -80,6 +80,9 @@ pub struct App {
     /// 双击桌面监听线程
     dbl_thread: u32,
     taskbar_created: u32,
+    /// --light / --dark：截图走查时强制主题，不读系统设置
+    force_dark: Option<bool>,
+    tray_icon: HICON,
 }
 
 static mut APP: *mut App = std::ptr::null_mut();
@@ -127,6 +130,20 @@ fn list_dir(dir: &Path) -> Vec<(String, bool, SystemTime)> {
     v
 }
 
+/// 托盘图标用 Windows 自带的“桌面”图标（imageres.dll 资源 183），按系统小图标尺寸取。
+/// 不用 LoadIconMetric：它只在 6.0 版通用控件库里有，程序没声明 6.0 时 exe 直接启动失败（2026-10-17 踩过）
+fn desktop_icon() -> HICON {
+    use windows::Win32::System::LibraryLoader::*;
+    unsafe {
+        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        LoadLibraryExW(w!("imageres.dll"), None, LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE)
+            .ok()
+            .and_then(|m| LoadImageW(Some(HINSTANCE(m.0)), PCWSTR(183 as *const u16), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR).ok())
+            .map(|h| HICON(h.0))
+            .unwrap_or_else(|| LoadIconW(None, IDI_APPLICATION).unwrap_or_default())
+    }
+}
+
 /// 销毁磁贴窗口；之后它的窗口过程不再碰这块磁贴
 fn destroy(t: &Tile) {
     unsafe {
@@ -160,18 +177,19 @@ pub fn popup(hwnd: HWND, pt: POINT, items: &[(u32, &str)]) -> u32 {
 
 impl App {
     fn load_theme(&mut self) {
-        let dark = reg_dword(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), w!("AppsUseLightTheme")) != Some(1);
+        let dark = self.force_dark.unwrap_or_else(|| reg_dword(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), w!("AppsUseLightTheme")) != Some(1));
         // AccentColor 是 0xAABBGGRR
         let c = reg_dword(w!("Software\\Microsoft\\Windows\\DWM"), w!("AccentColor")).unwrap_or(0xFFD47800);
         let (r, g, b) = ((c & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, ((c >> 16) & 0xFF) as f32 / 255.0);
-        let fg = if dark { 1.0 } else { 0.0 };
+        // 底色和文字取值见 scripts/contrast.ps1：亚克力背后是纯白（深色）或纯黑（浅色）时，正文和次要文字仍 ≥4.5:1
+        let (bg, fg) = if dark { (0x20 as f32 / 255.0, 0xF3 as f32 / 255.0) } else { (0xF3 as f32 / 255.0, 0x1A as f32 / 255.0) };
         self.theme = Theme {
             dark,
-            tint: if dark { rgba(0.08, 0.08, 0.09, 0.35) } else { rgba(1.0, 1.0, 1.0, 0.30) },
-            text: rgba(fg, fg, fg, if dark { 0.95 } else { 0.90 }),
-            muted: rgba(fg, fg, fg, 0.55),
-            hover: rgba(fg, fg, fg, if dark { 0.08 } else { 0.06 }),
-            line: rgba(fg, fg, fg, 0.10),
+            tint: rgba(bg, bg, bg, if dark { 0.78 } else { 0.88 }),
+            text: rgba(fg, fg, fg, 1.0),
+            muted: rgba(fg, fg, fg, 0.74),
+            hover: rgba(fg, fg, fg, 0.08),
+            press: rgba(fg, fg, fg, 0.16),
             sel_fill: rgba(r, g, b, 0.32),
             sel_line: rgba(r, g, b, 0.85),
         };
@@ -193,6 +211,15 @@ impl App {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(&self.cfg_path, self.cfg.to_text());
+    }
+
+    /// 标题栏图标用哪类文件的原版图标：按这块磁贴的第一条规则；None 表示用磁贴目录本身的图标
+    pub fn type_icon_name(&self, tile: &str) -> Option<String> {
+        match self.cfg.rules.iter().find(|(_, t)| t == tile).map(|(k, _)| k.as_str()) {
+            None | Some(rules::FOLDER_KEY) => None,
+            Some(rules::FALLBACK_KEY) => Some("desktiles".into()),
+            Some(ext) => Some(format!("desktiles.{ext}")),
+        }
     }
 
     fn tile_cfg(&mut self, name: &str) -> Option<&mut TileCfg> {
@@ -477,7 +504,7 @@ impl App {
             uID: 1,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_APP_TRAY,
-            hIcon: unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+            hIcon: self.tray_icon,
             ..Default::default()
         };
         for (d, s) in nid.szTip.iter_mut().zip("DeskTiles 桌面磁贴".encode_utf16()) {
@@ -621,7 +648,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 fn text_format(dw: &IDWriteFactory, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> IDWriteTextFormat {
     unsafe {
         let f = dw
-            .CreateTextFormat(w!("Segoe UI"), None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("zh-CN"))
+            .CreateTextFormat(w!("Segoe UI Variable Text"), None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("zh-CN"))
             .expect("创建字体失败");
         let _ = f.SetTextAlignment(align);
         let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -668,14 +695,15 @@ fn main() {
         let d2d: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).expect("D2D 初始化失败");
         let gfx = gfx::Gfx::new(&d2d).expect("D3D 初始化失败");
         let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("DirectWrite 初始化失败");
-        let fmt_title = text_format(&dw, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
+        let fmt_title = text_format(&dw, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
         let _ = fmt_title.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         ellipsis(&dw, &fmt_title);
         let fmt_count = text_format(&dw, 12.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING);
         let fmt_hint = text_format(&dw, 12.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
         let fmt_label = text_format(&dw, 12.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
         let _ = fmt_label.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-        let _ = fmt_label.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        // 长英文单词没有断行点，普通 WRAP 会在第一行就截断，EMERGENCY_BREAK 允许在词中换行，两行都用上
+        let _ = fmt_label.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
         ellipsis(&dw, &fmt_label);
         let edit_font = CreateFontW(
             -((13 * GetDpiForSystem()) as i32 / 72),
@@ -719,7 +747,7 @@ fn main() {
             fmt_label,
             fmt_hint,
             edit_font,
-            theme: Theme { dark: true, tint: rgba(0.0, 0.0, 0.0, 0.0), text: rgba(1.0, 1.0, 1.0, 1.0), muted: rgba(1.0, 1.0, 1.0, 0.5), hover: rgba(0.0, 0.0, 0.0, 0.0), line: rgba(0.0, 0.0, 0.0, 0.0), sel_fill: rgba(0.0, 0.0, 0.0, 0.0), sel_line: rgba(0.0, 0.0, 0.0, 0.0) },
+            theme: Theme { dark: true, tint: rgba(0.0, 0.0, 0.0, 0.0), text: rgba(1.0, 1.0, 1.0, 1.0), muted: rgba(1.0, 1.0, 1.0, 0.5), hover: rgba(0.0, 0.0, 0.0, 0.0), press: rgba(0.0, 0.0, 0.0, 0.0), sel_fill: rgba(0.0, 0.0, 0.0, 0.0), sel_line: rgba(0.0, 0.0, 0.0, 0.0) },
             hide_ext: true,
             hidden: false,
             topmost: args.iter().any(|a| a == "--top"),
@@ -727,6 +755,8 @@ fn main() {
             drop_helper: CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).ok(),
             dbl_thread: 0,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+            force_dark: if args.iter().any(|a| a == "--light") { Some(false) } else if args.iter().any(|a| a == "--dark") { Some(true) } else { None },
+            tray_icon: desktop_icon(),
         });
         a.load_theme();
         APP = &mut *a;
