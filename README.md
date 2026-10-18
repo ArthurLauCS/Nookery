@@ -1,82 +1,152 @@
-# DeskTiles
+# Nookery
 
-Windows 11 桌面磁贴。桌面上的散文件（文件夹、文档、图片等）会自动按类型收进对应的磁贴，快捷方式留在桌面不动。单个 318 KB 的 exe，常驻私有内存 12~14 MB，空闲时 CPU 为 0。磁贴背景是亚克力模糊，跟随系统深浅色；文件图标和每块磁贴标题上的图标都用系统原版图标（和资源管理器里看到的一样）。
+English | [简体中文](README.zh-CN.md)
 
-调研、方案对比和实测数据见 [docs/调研与方案.md](docs/调研与方案.md)。
+Desktop tiles for Windows 11. Loose files on your desktop (folders, documents, pictures, ...) are automatically sorted by type into tiles. Shortcuts stay on the desktop.
 
-## 构建
+- A single ~320 KB exe, 12–14 MB private memory, 0% CPU when idle.
+- Five tile opacity levels, down to fully transparent with only a faint border; follows the system light/dark theme.
+- Files show the same system icons you see in File Explorer.
+- English and Chinese interface.
+
+## Install
+
+Download `Nookery-Setup-<version>.exe` from [Releases](https://github.com/ArthurLauCS/Nookery/releases/latest) and run it. Requires Windows 11.
+
+- The installer is not signed with a commercial code-signing certificate, so Windows may show "Windows protected your PC". Click **More info** → **Run anyway**.
+- Setup asks for administrator permission once, to install the certificate for the desktop context menu. If you decline, Nookery still works, but **New tile** is only under **Show more options** in the desktop right-click menu.
+- The language you pick in setup is also Nookery's interface language. You can change it later from the tray menu.
+- On first run, Nookery tells you how many items it will sort and waits for your confirmation.
+
+## Where your files go
+
+- Sorted files are moved to `Desktop\.Nookery\<tile name>\` (a hidden system folder). They are still inside your desktop folder, so OneDrive desktop sync keeps working.
+- Settings are in `%APPDATA%\Nookery\config.txt`: tile positions, lock/collapse state, rules, opacity, pause state.
+- Create a folder inside `.Nookery` and it becomes a tile.
+- Uninstalling (installed version) stops Nookery, moves every file back to the desktop, and removes autostart, the context menu entry, the certificate, the language setting and the config. If you run the exe directly, click **Restore all to desktop** in the tray menu before deleting it.
+
+## Sorting rules
+
+| Tile | Contents |
+|---|---|
+| Folders | Folders |
+| Documents | doc docx pdf txt md rtf odt xls xlsx csv ppt pptx wps et dps |
+| Pictures | png jpg jpeg gif webp bmp svg heic ico psd |
+| Videos | mp4 mkv mov avi wmv flv webm |
+| Music | mp3 wav flac aac m4a ogg |
+| Archives | zip rar 7z tar gz |
+| Programs | exe msi |
+| Others | Everything else |
+
+Left on the desktop:
+
+- Shortcuts (`.lnk` `.url` `.appref-ms` `.website`)
+- Hidden and system files
+- Downloads in progress (`.crdownload`, `.part`, ...)
+- Office lock files (starting with `~$`)
+
+A file is moved only after it has been unchanged for 3 seconds and can be opened exclusively, and never while you are renaming an icon on the desktop.
+
+- **Change a rule**: drag a file from one tile to another; Nookery asks whether that extension should always go to the new tile.
+- **Keep on desktop**: a file dragged from a tile back to the desktop stays there (recorded as `keep` in the config). The record is cleared when the file is deleted or renamed.
+
+## Tile title bar
+
+- The name is centered. Click it to rename; click elsewhere or press Enter to save, Esc to cancel.
+- Drag the title bar to move the tile.
+- Two buttons at the top right appear on hover:
+  - Collapse / expand.
+  - Lock / unlock: a locked tile can't be moved or resized, but can still be renamed.
+- Locked tiles always show the lock icon; collapsed tiles always show the expand arrow.
+
+## Opacity
+
+Pick it under **Tile opacity** in the tray menu; it applies to all tiles.
+
+| Level | Look |
+|---|---|
+| 100% / 75% / 50% | Acrylic blur, thinner at lower levels |
+| 25% | Translucent, no blur |
+| 0% | Fully transparent with a faint border (white outside, black inside, visible on any wallpaper); the background fades in on hover |
+
+At 50% and below, text sits directly on the wallpaper and uses white text with a dark outline, like desktop icons.
+
+## Language
+
+English / Chinese. Switch under **Language** in the tray menu (in Chinese it reads "语言/Language", and the options are "中文/Chinese" and "English", so you can always find your way back). The setting is stored as `Language` under `HKCU\Software\Nookery`; if never set, Nookery follows the Windows display language. After switching:
+
+- Menus, messages and dialogs change immediately.
+- Default tiles (Folders, Documents, Pictures, ...) are renamed along with their folders. Tiles you renamed or created are left alone, as is any tile whose new name is already taken.
+- **New tile** in the desktop context menu follows the new language.
+
+## Controls
+
+| Action | Result |
+|---|---|
+| Double-click a file / Enter | Open |
+| Arrow keys / Home / End | Move the selection (shows a focus ring) |
+| Right-click a file | System context menu |
+| F2 | Rename |
+| Delete (Shift+Delete) | Move to Recycle Bin (delete permanently) |
+| Ctrl+A / C / X / V | Select all / copy / cut / paste |
+| Drag out / drag in | Same as File Explorer: move on the same drive, copy across drives; hold Ctrl to copy, Shift to move; the target tile highlights |
+| Drag the title bar | Move anywhere; snaps within 8 px of screen edges and other tiles, hold Alt to disable snapping |
+| Drag an edge | Resize, with the same snapping; minimum height is one row of icons |
+| Right-click the title bar or empty space | Open in File Explorer, Delete tile |
+| Right-click the desktop → New tile | Creates a tile where you clicked and starts renaming it. In the first-level Windows 11 menu for the installed version; under **Show more options** (or Shift+right-click) when running the exe directly |
+| Double-click empty desktop space | Hide / show all tiles, with a hint above the cursor |
+| Left-click the tray icon | Hide / show all tiles |
+| Right-click the tray icon | New tile, Hide tiles, Double-click desktop to hide tiles (toggle), Pause auto-sorting, Tile opacity, Restore all to desktop, Start with Windows, Language, Exit |
+
+Tiles are rebuilt automatically if File Explorer restarts.
+
+## Build
 
 ```bash
 cargo build --release
 ```
 
-产物在 `target/release/desktiles.exe`，需要 Rust 工具链和 MSVC 生成工具。
+Output: `target/release/nookery.exe`. Requires the Rust toolchain and MSVC build tools.
 
-## 文件放在哪
+Installer (requires [Inno Setup 6](https://jrsoftware.org/isdl.php) and the Windows SDK):
 
-- 归进磁贴的文件实际移到 `桌面\.DeskTiles\<磁贴名>\`。这个目录带隐藏和系统属性，路径会变，文件仍在桌面目录下，OneDrive 桌面同步照常生效。
-- 配置（磁贴位置、规则、暂停状态）在 `%APPDATA%\DeskTiles\config.txt`。
-- 在 `.DeskTiles` 里手动建一个文件夹，它也会变成一块磁贴。
-全部还原到桌面。“全部还原到桌面”。
+```bash
+powershell -File scripts/installer.ps1
+```
 
-## 归类规则
+Builds release (including the context menu extension in `menu/`), packs `installer/AppxManifest.xml` into a signed sparse package, then builds `target/installer/Nookery-Setup-<version>.exe` using the version in `Cargo.toml`. Signing uses the self-signed `CN=Nookery` certificate in the current user's store, created automatically if missing. The setup script is `installer/nookery.iss`; the Simplified Chinese messages `installer/ChineseSimplified.isl` come from the unofficial translations in the Inno Setup repository.
 
-| 磁贴 | 内容 |
-|---|---|
-| 文件夹 | 目录 |
-| 文档 | doc docx pdf txt md rtf odt xls xlsx csv ppt pptx wps et dps |
-| 图片 | png jpg jpeg gif webp bmp svg heic ico psd |
-| 视频 | mp4 mkv mov avi wmv flv webm |
-| 音频 | mp3 wav flac aac m4a ogg |
-| 压缩包 | zip rar 7z tar gz |
-| 程序 | exe msi |
-| 其他 | 以上都不是的 |
+The app icon sources are `assets/icon.svg` (40 px and up) and `assets/icon-small.svg` (16–32 px). Run `python scripts/icon.py` to regenerate `assets/app.ico` and `assets/app.res` (requires Chrome, Pillow and the Windows SDK); `build.rs` links them into the exe.
 
-不归类、留在桌面的：
+Design research and benchmarks are in [docs/调研与方案.md](docs/调研与方案.md) (Chinese).
 
-- 快捷方式（`.lnk` `.url` `.appref-ms` `.website`）
-- 隐藏文件和系统文件
-- 下载中的临时文件（`.crdownload` `.part` 等）
-- Office 锁文件（`~$` 开头）
-
-文件要 3 秒内没有改动、能独占打开才会移走；你正在桌面上给图标改名时也不移。
-
-把某种文件从一块磁贴拖到另一块，会问你以后这种扩展名是否都放进新磁贴。
-
-从磁贴拖回桌面的文件会留在桌面，不再被收回去（记在配置的 `keep` 里）；把它删掉或改名后，这条记录自动清掉。
-
-## 操作
-
-| 操作 | 效果 |
-|---|---|
-| 双击文件 / Enter | 打开 |
-| 方向键 / Home / End | 移动选中项（显示键盘焦点环） |
-| 右键文件 | 系统右键菜单 |
-| F2 | 改名 |
-| Delete（Shift+Delete） | 删到回收站（彻底删除） |
-| Ctrl+A / C / X / V | 全选 / 复制 / 剪切 / 粘贴 |
-| 拖出 / 拖入 | 和资源管理器一样，同盘移动、跨盘复制；按住 Ctrl 复制、Shift 移动；拖到磁贴上时磁贴高亮 |
-| 拖标题栏 | 移动，靠近屏幕边缘或其他磁贴时自动吸附 |
-| 拖边缘 | 改尺寸，同样吸附；最小一行图标高 |
-| 双击标题栏 | 折叠 / 展开 |
-| 右键标题栏或空白处 | 重命名、折叠、打开所在文件夹、粘贴、新建磁贴、删除磁贴 |
-| 双击桌面空白处、左键单击托盘图标 | 隐藏 / 显示全部磁贴 |
-| 右键托盘图标 | 新建磁贴、隐藏磁贴、双击桌面空白处隐藏磁贴（开关）、暂停自动归类、全部还原到桌面、开机自启、退出 |
-
-资源管理器重启后磁贴会自动重建。
-
-## 测试
+## Test
 
 ```bash
 cargo test
 ```
 
-`scripts/` 下是用假桌面做的端到端测试，不会碰真实桌面：
+The scripts in `scripts/` run end-to-end tests on a fake desktop and never touch your real one:
 
-- `setup.ps1`：在 `C:\WorkFile\Temp\fakedesk` 造一批测试文件；加 `-Bulk 200` 再多造 200 个。
-- `run.ps1`：用 `--root` 指向假桌面启动，检查归类结果、内存和 CPU，并截图。
-- `interact.ps1`：借助 `examples/drive.rs` 给磁贴窗口发消息，测选中、F2 改名、折叠，以及拖回桌面的文件留在桌面。
-- `design.ps1 -Round N`：设计走查取证，深浅两套主题下截默认、选中、按下、键盘焦点、窄 / 宽 / 折叠各状态，外加去色版。
-- `contrast.ps1`：算主题配色在最坏背景下的对比度。
+- `setup.ps1`: creates test files in `C:\WorkFile\Temp\fakedesk`; `-Bulk 200` adds 200 more.
+- `run.ps1`: starts Nookery with `--root` pointing at the fake desktop, checks sorting, memory and CPU, and takes screenshots.
+- `interact.ps1`: sends messages to tile windows via `examples/drive.rs` to test selection, F2 rename, the collapse button, and files dragged back to the desktop.
+- `design.ps1 -Round N`: screenshots for design review on a busy fake wallpaper (`backdrop.ps1`), plus grayscale copies:
+  - Dark 100 / 75 / 50 / 25 / 0% and light 100%.
+  - Locked, collapsed, selected.
+  - Renaming, the double-click hint, a second process with `--new-tile`.
+- `contrast.ps1`: computes theme contrast against the worst-case background.
 
-`--root <目录>` 用指定目录代替桌面，配置也存进那个目录；`--top` 让磁贴置顶，便于截图；`--light` / `--dark` 强制主题。
+Command-line options:
+
+| Option | Purpose |
+|---|---|
+| `--root <dir>` | Use a directory instead of the desktop; config is stored there too |
+| `--top` | Keep tiles topmost, for screenshots |
+| `--light` / `--dark` | Force a theme |
+| `--new-tile` | New tile at the cursor; forwarded to the running instance if there is one |
+| `--uninstall` | Move all files back to the desktop, remove autostart and the context menu, then exit (called by the uninstaller after stopping the running instance); combine with `--root` to test on a fake desktop |
+
+## License
+
+[MIT](LICENSE)
