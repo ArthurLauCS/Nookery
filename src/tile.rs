@@ -337,7 +337,8 @@ impl Tile {
 
     fn display_name<'n>(a: &App, it: &'n Item) -> &'n str {
         match it.name.rfind('.') {
-            Some(i) if a.hide_ext && !it.is_dir && i > 0 => &it.name[..i],
+            // 快捷方式和桌面上一样总是不显示扩展名
+            Some(i) if !it.is_dir && i > 0 && (a.hide_ext || it.name[i..].eq_ignore_ascii_case(".lnk")) => &it.name[..i],
             _ => &it.name,
         }
     }

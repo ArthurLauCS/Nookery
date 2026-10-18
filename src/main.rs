@@ -311,6 +311,11 @@ impl App {
                 for e in std::fs::read_dir(&self.root).into_iter().flatten().flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
                     let Ok(md) = e.metadata() else { continue };
+                    // 系统图标的快捷方式从磁贴拖回桌面：删掉它，下面的 sync_desk_icons 把原图标显示回来
+                    if !self.cfg.desk.is_empty() && rules::ext_of(&name) == "lnk" && shell::link_clsid(&e.path()).is_some_and(|id| self.cfg.desk.contains(&id)) {
+                        let _ = std::fs::remove_file(e.path());
+                        continue;
+                    }
                     seen.push(name.clone());
                     if name == DATA_DIR || self.cfg.keep.contains(&name) {
                         continue;
@@ -346,7 +351,33 @@ impl App {
         if wait {
             unsafe { SetTimer(Some(self.main), T_RECHECK, 1000, None) };
         }
+        self.sync_desk_icons();
         self.sync_tiles();
+    }
+
+    /// 磁贴里有指向此电脑、回收站等的快捷方式时，隐藏桌面上的原图标，像是挪进了磁贴；快捷方式都没了再显示回来
+    fn sync_desk_icons(&mut self) {
+        let mut linked: Vec<String> = std::fs::read_dir(&self.data)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
+            .filter(|e| rules::ext_of(&e.file_name().to_string_lossy()) == "lnk")
+            .filter_map(|e| shell::link_clsid(&e.path()))
+            .collect();
+        linked.sort();
+        linked.dedup();
+        if linked == self.cfg.desk {
+            return;
+        }
+        for id in linked.iter().filter(|id| !self.cfg.desk.contains(id)) {
+            shell::show_desktop_icon(id, false);
+        }
+        for id in self.cfg.desk.iter().filter(|id| !linked.contains(id)) {
+            shell::show_desktop_icon(id, true);
+        }
+        self.cfg.desk = linked;
+        self.save();
     }
 
     /// 按配置和磁贴目录的内容建窗口、刷新列表、决定显隐
@@ -567,7 +598,7 @@ impl App {
         self.cfg.tiles.retain(|t| t.name != name);
         let dir = self.data.join(name);
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            shell::move_unique(&e.path(), &self.root);
+            put_back(&e.path(), &self.root);
         }
         let _ = std::fs::remove_dir(&dir);
         if let Some(k) = self.tiles.iter().position(|t| t.name == name) {
@@ -899,6 +930,19 @@ fn register_desktop_menu() {
     }
 }
 
+/// 磁贴里的一项放回桌面；系统图标的快捷方式不放回，删掉它、把桌面上的原图标显示回来
+fn put_back(path: &Path, root: &Path) {
+    match (rules::ext_of(&path.to_string_lossy()) == "lnk").then(|| shell::link_clsid(path)).flatten() {
+        Some(id) => {
+            shell::show_desktop_icon(&id, true);
+            let _ = std::fs::remove_file(path);
+        }
+        None => {
+            shell::move_unique(path, root);
+        }
+    }
+}
+
 /// .Nookery 下每个磁贴目录里的东西都放回桌面，并去掉桌面右键菜单
 fn restore(root: &Path) {
     unsafe {
@@ -906,7 +950,7 @@ fn restore(root: &Path) {
     }
     for d in std::fs::read_dir(root.join(DATA_DIR)).into_iter().flatten().flatten() {
         for e in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
-            shell::move_unique(&e.path(), root);
+            put_back(&e.path(), root);
         }
     }
 }
@@ -930,7 +974,11 @@ fn main() {
     let root = test_root.clone().unwrap_or_else(shell::desktop_dir);
     lang::load();
     if args.iter().any(|a| a == "--uninstall") {
-        // 卸载程序调用（调用前已结束正在运行的实例）：文件放回桌面，删开机自启和右键菜单，空的磁贴目录一并删掉
+        // 卸载程序调用（调用前已结束正在运行的实例）：文件放回桌面，删开机自启和右键菜单，空的磁贴目录一并删掉。
+        // 读快捷方式（认出系统图标）要先初始化 COM
+        unsafe {
+            let _ = OleInitialize(None);
+        }
         restore(&root);
         unsafe {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Nookery"));

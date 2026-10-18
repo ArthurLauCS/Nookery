@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Ole::*;
+use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -188,6 +189,62 @@ fn to_bitmap(rt: &ID2D1RenderTarget, f: &IShellItemImageFactory, px: i32, flags:
         };
         let _ = DeleteObject(hbm.into());
         result
+    }
+}
+
+/// 没有文件路径的系统项（此电脑、回收站、控制面板等）在 dir 里建一个指向它的快捷方式，重名时加序号
+pub fn make_link(item: &IShellItem, dir: &Path) {
+    unsafe {
+        let Ok(link) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) else { return };
+        let Ok(pidl) = SHGetIDListFromObject(item) else { return };
+        let _ = link.SetIDList(pidl);
+        CoTaskMemFree(Some(pidl as _));
+        let Ok(name) = item.GetDisplayName(SIGDN_NORMALDISPLAY) else { return };
+        let mut stem = name.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(name.0 as _));
+        stem.retain(|c| !r#"\/:*?"<>|"#.contains(c));
+        let Ok(file) = link.cast::<IPersistFile>() else { return };
+        for n in 1..100 {
+            let dst = if n == 1 { dir.join(format!("{stem}.lnk")) } else { dir.join(format!("{stem} ({n}).lnk")) };
+            if !dst.exists() {
+                let _ = file.Save(PCWSTR(wpath(&dst).as_ptr()), true);
+                return;
+            }
+        }
+    }
+}
+
+/// 桌面上系统图标（此电脑、回收站等）的 CLSID，如 "{20D04FE0-3AEA-1069-A2D8-08002B30309D}"；别的项返回 None
+pub fn desktop_clsid(item: &IShellItem) -> Option<String> {
+    unsafe {
+        let p = item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING).ok()?;
+        let s = p.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(p.0 as _));
+        let id = s.strip_prefix("::")?;
+        (id.starts_with('{') && !id.contains('\\')).then(|| id.to_string())
+    }
+}
+
+/// 快捷方式指向的桌面系统图标的 CLSID
+pub fn link_clsid(path: &Path) -> Option<String> {
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        link.cast::<IPersistFile>().ok()?.Load(PCWSTR(wpath(path).as_ptr()), STGM_READ).ok()?;
+        let pidl = link.GetIDList().ok()?;
+        let item = SHCreateItemFromIDList::<IShellItem>(pidl);
+        CoTaskMemFree(Some(pidl as _));
+        desktop_clsid(&item.ok()?)
+    }
+}
+
+/// 显示或隐藏桌面上的系统图标，和“桌面图标设置”里的勾选是同一个开关
+pub fn show_desktop_icon(clsid: &str, show: bool) {
+    let (name, v) = (wide(clsid), (!show) as u32);
+    unsafe {
+        let key = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel");
+        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, key, PCWSTR(name.as_ptr()), REG_DWORD.0, Some(&v as *const u32 as _), 4);
+        // 让桌面马上刷新
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
 }
 

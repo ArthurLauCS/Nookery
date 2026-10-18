@@ -48,12 +48,14 @@ pub struct Config {
     pub opacity: u8,
     /// 默认磁贴名当前是英文；旧配置没有这一项，都是中文
     pub en: bool,
+    /// 因为放进了磁贴而隐藏的桌面系统图标（CLSID，排好序）
+    pub desk: Vec<String>,
 }
 
 impl Config {
     /// 空文本得到默认配置
     pub fn parse(text: &str) -> Config {
-        let mut cfg = Config { tiles: Vec::new(), rules: Vec::new(), paused: false, dblclick: true, keep: Vec::new(), opacity: 100, en: false };
+        let mut cfg = Config { tiles: Vec::new(), rules: Vec::new(), paused: false, dblclick: true, keep: Vec::new(), opacity: 100, en: false, desk: Vec::new() };
         // 用记事本存成“带 BOM 的 UTF-8”时第一行前面多一个 BOM，不去掉第一项设置就读不出来
         for line in text.trim_start_matches('\u{feff}').lines() {
             let f: Vec<&str> = line.split('|').collect();
@@ -61,6 +63,7 @@ impl Config {
                 ["paused", v] => cfg.paused = *v == "1",
                 ["dblclick", v] => cfg.dblclick = *v == "1",
                 ["keep", name] => cfg.keep.push(name.to_string()),
+                ["desk", id] => cfg.desk.push(id.to_string()),
                 ["rule", key, tile] => cfg.rules.push((key.to_string(), tile.to_string())),
                 ["opacity", v] => cfg.opacity = v.parse().unwrap_or(100),
                 ["lang", v] => cfg.en = *v == "en",
@@ -101,6 +104,9 @@ impl Config {
         }
         for k in &self.keep {
             s += &format!("keep|{k}\n");
+        }
+        for id in &self.desk {
+            s += &format!("desk|{id}\n");
         }
         s
     }
@@ -204,12 +210,14 @@ mod tests {
         cfg.keep.push("放在桌面.docx".into());
         cfg.tiles[1].locked = true;
         cfg.opacity = 25;
+        cfg.desk.push("{645FF040-5081-101B-9F08-00AA002F954E}".into());
         let back = Config::parse(&cfg.to_text());
         assert_eq!(classify(&back, "说明.pdf", false, false), Some("图片"));
         assert_eq!(back.tiles[1].rect, [10, 20, 300, 200]);
         assert!(back.tiles[1].rolled && back.paused && !back.dblclick);
         assert!(Config::parse("").dblclick);
         assert_eq!(back.keep, ["放在桌面.docx"]);
+        assert_eq!(back.desk, ["{645FF040-5081-101B-9F08-00AA002F954E}"]);
         assert!(back.tiles[1].locked && !back.tiles[0].locked);
         assert_eq!((back.opacity, Config::parse("").opacity), (25, 100));
         // 旧格式（没有锁定列）照样能读

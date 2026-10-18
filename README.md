@@ -91,6 +91,7 @@ English / Chinese. Switch under **Language** in the tray menu (in Chinese it rea
 | Ctrl+A / C / X / V | Select all / copy / cut / paste |
 | Drag out / drag in | Same as File Explorer: move on the same drive, copy across drives; hold Ctrl to copy, Shift to move; the target tile highlights |
 | Drag an icon within a tile | Reorder; a line marks where it will land, and the order is remembered |
+| Drag This PC, Recycle Bin, etc. from the desktop into a tile | Adds a shortcut to the tile and hides the original desktop icon; the icon comes back once the shortcut leaves every tile (deleted, dragged back to the desktop, tile deleted, restore all, uninstall) |
 | Drag the title bar | Move anywhere; snaps within 8 px of screen edges and other tiles, hold Alt to disable snapping |
 | Drag an edge | Resize, with the same snapping; minimum height is one row of icons |
 | Right-click the title bar or empty space | Open in File Explorer, Delete tile |
