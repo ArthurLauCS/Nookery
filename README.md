@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 Desktop tiles for Windows 11. Loose files on your desktop (folders, documents, pictures, ...) are automatically sorted by type into tiles. Shortcuts stay on the desktop.
 
-- A single ~320 KB exe, 12–14 MB private memory, 0% CPU when idle.
+- A single ~390 KB exe, 12–14 MB private memory, 0% CPU when idle.
 - Five tile opacity levels, down to fully transparent with only a faint border; follows the system light/dark theme.
 - Files show the same system icons you see in File Explorer.
 - English and Chinese interface.
