@@ -148,20 +148,6 @@ pub fn load_icon(rt: &ID2D1RenderTarget, path: &Path, px: i32) -> Option<ID2D1Bi
     }
 }
 
-/// 一类文件的原版图标（关联程序的图标），文件不需要存在：用只带路径的简单 PIDL，资源管理器按扩展名取图标
-pub fn load_type_icon(rt: &ID2D1RenderTarget, name: &str, px: i32) -> Option<ID2D1Bitmap> {
-    unsafe {
-        let p = wide(&format!("C:\\{name}"));
-        let pidl = SHSimpleIDListFromPath(PCWSTR(p.as_ptr()));
-        if pidl.is_null() {
-            return None;
-        }
-        let f = SHCreateItemFromIDList::<IShellItemImageFactory>(pidl);
-        ILFree(Some(pidl));
-        to_bitmap(rt, &f.ok()?, px, SIIGBF_ICONONLY)
-    }
-}
-
 fn to_bitmap(rt: &ID2D1RenderTarget, f: &IShellItemImageFactory, px: i32, flags: SIIGBF) -> Option<ID2D1Bitmap> {
     unsafe {
         let hbm = f.GetImage(SIZE { cx: px, cy: px }, flags).ok()?;

@@ -1,5 +1,5 @@
 [package]
-name = "desktiles"
+name = "nookery"
 version = "0.1.0"
 edition = "2024"
 
@@ -21,6 +21,7 @@ features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Globalization",
     "Win32_Graphics_Imaging",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
