@@ -90,6 +90,7 @@ English / Chinese. Switch under **Language** in the tray menu (in Chinese it rea
 | Delete (Shift+Delete) | Move to Recycle Bin (delete permanently) |
 | Ctrl+A / C / X / V | Select all / copy / cut / paste |
 | Drag out / drag in | Same as File Explorer: move on the same drive, copy across drives; hold Ctrl to copy, Shift to move; the target tile highlights |
+| Drag an icon within a tile | Reorder; a line marks where it will land, and the order is remembered |
 | Drag the title bar | Move anywhere; snaps within 8 px of screen edges and other tiles, hold Alt to disable snapping |
 | Drag an edge | Resize, with the same snapping; minimum height is one row of icons |
 | Right-click the title bar or empty space | Open in File Explorer, Delete tile |

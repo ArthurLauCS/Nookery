@@ -31,6 +31,8 @@ pub struct TileCfg {
     pub keep: bool,
     /// 锁定后不能拖动、不能改尺寸
     pub locked: bool,
+    /// 用户在磁贴里拖出来的顺序（文件名）；不在其中的项按默认顺序排在后面
+    pub order: Vec<String>,
 }
 
 pub struct Config {
@@ -62,20 +64,21 @@ impl Config {
                 ["rule", key, tile] => cfg.rules.push((key.to_string(), tile.to_string())),
                 ["opacity", v] => cfg.opacity = v.parse().unwrap_or(100),
                 ["lang", v] => cfg.en = *v == "en",
-                // 旧配置没有锁定这一列
-                ["tile", name, x, y, w, h, rolled, keep, locked @ ..] => cfg.tiles.push(TileCfg {
+                // 旧配置没有锁定和顺序这两段；顺序是锁定之后的若干列文件名（文件名不会含 |）
+                ["tile", name, x, y, w, h, rolled, keep, rest @ ..] => cfg.tiles.push(TileCfg {
                     name: name.to_string(),
                     rect: [x, y, w, h].map(|v| v.parse().unwrap_or(0)),
                     rolled: *rolled == "1",
                     keep: *keep == "1",
-                    locked: locked.first() == Some(&"1"),
+                    locked: rest.first() == Some(&"1"),
+                    order: rest.iter().skip(1).map(|s| s.to_string()).collect(),
                 }),
                 _ => {}
             }
         }
         if cfg.tiles.is_empty() && cfg.rules.is_empty() {
             for (name, _, keys) in DEFAULT_TILES {
-                cfg.tiles.push(TileCfg { name: name.into(), rect: [0; 4], rolled: false, keep: false, locked: false });
+                cfg.tiles.push(TileCfg { name: name.into(), rect: [0; 4], rolled: false, keep: false, locked: false, order: Vec::new() });
                 cfg.rules.extend(keys.split(' ').map(|k| (k.to_string(), name.to_string())));
             }
         }
@@ -87,7 +90,11 @@ impl Config {
         let mut s = format!("paused|{}\ndblclick|{}\nopacity|{}\nlang|{lang}\n", self.paused as u8, self.dblclick as u8, self.opacity);
         for t in &self.tiles {
             let [x, y, w, h] = t.rect;
-            s += &format!("tile|{}|{x}|{y}|{w}|{h}|{}|{}|{}\n", t.name, t.rolled as u8, t.keep as u8, t.locked as u8);
+            s += &format!("tile|{}|{x}|{y}|{w}|{h}|{}|{}|{}", t.name, t.rolled as u8, t.keep as u8, t.locked as u8);
+            for o in &t.order {
+                s += &format!("|{o}");
+            }
+            s += "\n";
         }
         for (k, t) in &self.rules {
             s += &format!("rule|{k}|{t}\n");
@@ -140,6 +147,14 @@ pub fn ext_of(name: &str) -> String {
         Some(i) if i > 0 => name[i + 1..].to_lowercase(),
         _ => String::new(),
     }
+}
+
+/// 把 list 里属于 moved 的项（保持原有先后）挪到第 at 项前面；at 可以等于 list.len()（挪到最后）
+pub fn reorder(list: &[String], moved: &[String], at: usize) -> Vec<String> {
+    let at = at - list[..at].iter().filter(|n| moved.contains(n)).count();
+    let mut v: Vec<String> = list.iter().filter(|n| !moved.contains(n)).cloned().collect();
+    v.splice(at..at, list.iter().filter(|n| moved.contains(n)).cloned());
+    v
 }
 
 /// 桌面根目录上的一项该归入哪个磁贴；None 表示留在桌面
@@ -201,6 +216,19 @@ mod tests {
         assert!(!Config::parse("tile|文档|1|2|3|4|0|0").tiles[0].locked);
         assert_eq!(Config::parse("\u{feff}opacity|50").opacity, 50);
         assert_eq!(back.tiles.len(), 8);
+        cfg.tiles[2].order = vec!["b.png".into(), "a b.png".into()];
+        assert_eq!(Config::parse(&cfg.to_text()).tiles[2].order, ["b.png", "a b.png"]);
+        assert!(back.tiles[1].order.is_empty());
+    }
+
+    #[test]
+    fn reorder_moves_before_slot() {
+        let l: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(reorder(&l, &s(&["a"]), 3), s(&["b", "c", "a", "d"]));
+        assert_eq!(reorder(&l, &s(&["d"]), 0), s(&["d", "a", "b", "c"]));
+        assert_eq!(reorder(&l, &s(&["b", "d"]), 4), s(&["a", "c", "b", "d"]));
+        assert_eq!(reorder(&l, &s(&["a", "c"]), 2), s(&["b", "a", "c", "d"]));
     }
 
     #[test]

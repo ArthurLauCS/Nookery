@@ -13,6 +13,7 @@ mod shell;
 mod tile;
 mod toast;
 
+use std::collections::HashMap;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -327,7 +328,7 @@ impl App {
                         continue;
                     }
                     if self.tile_cfg(&tile).is_none() {
-                        self.cfg.tiles.push(TileCfg { name: tile.clone(), rect: [0; 4], rolled: false, keep: false, locked: false });
+                        self.cfg.tiles.push(TileCfg { name: tile.clone(), rect: [0; 4], rolled: false, keep: false, locked: false, order: Vec::new() });
                     }
                     let dir = self.data.join(&tile);
                     let _ = std::fs::create_dir_all(&dir);
@@ -355,13 +356,13 @@ impl App {
         for e in std::fs::read_dir(&self.data).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             if e.metadata().is_ok_and(|m| m.is_dir() && !is_hidden(&m)) && self.tile_cfg(&name).is_none() {
-                self.cfg.tiles.push(TileCfg { name, rect: [0; 4], rolled: false, keep: true, locked: false });
+                self.cfg.tiles.push(TileCfg { name, rect: [0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
                 changed = true;
             }
         }
         for i in 0..self.cfg.tiles.len() {
             let name = self.cfg.tiles[i].name.clone();
-            let list = list_dir(&self.data.join(&name));
+            let list = self.listing(i);
             let visible = !self.hidden && (!list.is_empty() || self.cfg.tiles[i].keep);
             let idx = match self.tiles.iter().position(|t| t.name == name) {
                 Some(k) => k,
@@ -391,6 +392,26 @@ impl App {
         if changed {
             self.save();
         }
+    }
+
+    /// 第 i 块磁贴目录的内容：拖过的项按配置里的顺序在前，其余按 list_dir 的顺序跟在后面
+    fn listing(&self, i: usize) -> Vec<(String, bool, SystemTime)> {
+        let c = &self.cfg.tiles[i];
+        let mut list = list_dir(&self.data.join(&c.name));
+        if !c.order.is_empty() {
+            let pos: HashMap<&str, usize> = c.order.iter().enumerate().map(|(k, o)| (o.as_str(), k)).collect();
+            list.sort_by_key(|e| pos.get(e.0.as_str()).copied().unwrap_or(usize::MAX));
+        }
+        list
+    }
+
+    /// 磁贴内拖动排序：moved 挪到第 at 项前面，整个顺序存进配置
+    pub fn reorder(&mut self, t: &mut Tile, moved: &[String], at: usize) {
+        let Some(i) = self.cfg.tiles.iter().position(|c| c.name == t.name) else { return };
+        let names: Vec<String> = t.items.iter().map(|it| it.name.clone()).collect();
+        self.cfg.tiles[i].order = rules::reorder(&names, moved, at);
+        self.save();
+        t.set_items(self.listing(i));
     }
 
     /// 新磁贴从主屏工作区右上角起，按列往下堆，一列放不下换左边一列；高度按文件数取 1~3 行
@@ -455,7 +476,13 @@ impl App {
             Some(old) if old != new => {
                 let (from, to) = (shell::wpath(&dir.join(&old)), shell::wpath(&dir.join(new)));
                 match unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVE_FILE_FLAGS(0)) } {
-                    Ok(()) => t.sel = vec![new.to_string()],
+                    Ok(()) => {
+                        t.sel = vec![new.to_string()];
+                        // 排过序的项改名后留在原位
+                        if self.tile_cfg(&t.name).and_then(|c| c.order.iter_mut().find(|o| **o == old)).map(|o| *o = new.to_string()).is_some() {
+                            self.save();
+                        }
+                    }
                     Err(e) => self.warn(t, &format!("{}{}", tr("改名失败：", "Rename failed: "), e.message())),
                 }
             }
@@ -513,7 +540,7 @@ impl App {
             name = format!("{base} {n}");
         }
         let _ = std::fs::create_dir_all(self.data.join(&name));
-        self.cfg.tiles.push(TileCfg { name: name.clone(), rect: [0; 4], rolled: false, keep: true, locked: false });
+        self.cfg.tiles.push(TileCfg { name: name.clone(), rect: [0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
         let i = self.cfg.tiles.len() - 1;
         self.place(i, 0);
         if let Some(pt) = at {

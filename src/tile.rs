@@ -83,6 +83,8 @@ pub struct Tile {
     edit: Option<(HWND, Option<String>)>,
     /// 有文件正拖在上面
     pub drop_hot: bool,
+    /// 磁贴内拖动排序时的插入位置，画一条竖线
+    pub insert: Option<usize>,
     /// 标题文字实际占的横向范围，单击这里进入改名
     name_span: (f32, f32),
     /// 键盘焦点所在项；kbd 为真时画焦点环（用键盘操作过、还没再点鼠标）
@@ -153,6 +155,7 @@ impl Tile {
             press: None,
             edit: None,
             drop_hot: false,
+            insert: None,
             name_span: (0.0, 0.0),
             focus: 0,
             kbd: false,
@@ -304,6 +307,20 @@ impl Tile {
         }
         let i = row as usize * n + col;
         (i < self.items.len()).then_some(i)
+    }
+
+    /// 屏幕坐标处的插入位置（0..=项数）：落在格子左半边插到它前面，右半边插到它后面
+    pub fn slot_at(&self, x: i32, y: i32) -> usize {
+        let mut p = POINT { x, y };
+        unsafe {
+            let _ = ScreenToClient(self.hwnd, &mut p);
+        }
+        let s = scale(self.hwnd);
+        let (w, _) = self.size_dip();
+        let (n, cw) = grid(w);
+        let col = (((p.x as f32 / s - PAD) / cw + 0.5).max(0.0) as usize).min(n);
+        let row = ((p.y as f32 / s - TITLE_H - PAD + self.scroll) / CELL_H).max(0.0) as usize;
+        (row * n + col).min(self.items.len())
     }
 
     fn btn_at(&self, x: f32, y: f32) -> Btn {
@@ -466,6 +483,12 @@ impl Tile {
                     if let Some(l) = &it.layout {
                         text(l, r.left + 4.0, r.top + PAD + ICON + GAP, &th.text);
                     }
+                }
+                if let Some(k) = self.insert {
+                    let r = self.item_rect(k.min(self.items.len() - 1), w);
+                    let x = if k < self.items.len() { r.left } else { r.right };
+                    br.SetColor(&th.sel_line);
+                    rt.FillRectangle(&rect(x - 1.0, r.top + 6.0, x + 1.0, r.bottom - 6.0), br);
                 }
                 rt.PopAxisAlignedClip();
                 let total = self.content_h(w);
