@@ -168,6 +168,15 @@ fn to_bitmap(rt: &ID2D1RenderTarget, f: &IShellItemImageFactory, px: i32, flags:
             // 缩略图不带 alpha 时整张 alpha 为 0，补成不透明
             if buf.chunks_exact(4).all(|c| c[3] == 0) {
                 buf.chunks_exact_mut(4).for_each(|c| c[3] = 255);
+            } else if buf.chunks_exact(4).any(|c| c[0].max(c[1]).max(c[2]) > c[3]) {
+                // 图标是没预乘的 alpha（2026-10-18 实测 notepad.exe 48px 有 242 个像素颜色值大于 alpha），
+                // 当成预乘画，半透明的边缘会发亮、发毛：先乘上 alpha
+                for c in buf.chunks_exact_mut(4) {
+                    let a = c[3] as u32;
+                    for v in &mut c[..3] {
+                        *v = ((*v as u32 * a + 127) / 255) as u8;
+                    }
+                }
             }
             let props = D2D1_BITMAP_PROPERTIES {
                 pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },

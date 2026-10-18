@@ -26,8 +26,9 @@ use crate::{App, app, fit_work_area, popup};
 pub const TITLE_H: f32 = 36.0;
 pub const PAD: f32 = 8.0;
 const CELL_W: f32 = 84.0;
-pub const CELL_H: f32 = 88.0;
-const ICON: f32 = 40.0;
+pub const CELL_H: f32 = 96.0;
+/// 和桌面默认的“中等图标”一样大：图标文件里一般就有这一档，不用缩放
+const ICON: f32 = 48.0;
 /// 图标下沿到文件名的距离
 const GAP: f32 = 8.0;
 const LABEL_H: f32 = 32.0;
@@ -450,11 +451,13 @@ impl Tile {
                     }
                     let it = &mut self.items[i];
                     if let Some(bmp) = &it.icon {
-                        let sz = bmp.GetSize();
-                        let (bw, bh) = (sz.width / s, sz.height / s);
-                        let x = (r.left + r.right - bw) / 2.0;
-                        let y = r.top + 8.0 + (ICON - bh) / 2.0;
-                        rt.DrawBitmap(bmp, Some(&rect(x, y, x + bw, y + bh)), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                        // 按位图原尺寸、对齐到整像素画：落在半像素上会被插值糊掉
+                        let px = bmp.GetPixelSize();
+                        let (bw, bh) = (px.width as f32, px.height as f32);
+                        let x = (((r.left + r.right) * s - bw) / 2.0).round();
+                        let y = ((r.top + PAD) * s + (ICON * s - bh) / 2.0).round();
+                        let dst = rect(x / s, y / s, (x + bw) / s, (y + bh) / s);
+                        rt.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None);
                     }
                     if it.layout.is_none() {
                         let t = u16s(Self::display_name(a, it));
