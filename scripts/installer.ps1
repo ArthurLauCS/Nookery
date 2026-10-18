@@ -3,6 +3,8 @@
 # 签名用当前用户证书库里的自签证书 CN=Nookery，没有就新建。换电脑打包会新建另一张，装过旧包的机器升级时会再装一张，不影响使用。
 $root = "$PSScriptRoot\.."
 $out = "$root\target\installer"
+# 只留本次版本的产物，旧版本的安装包不累计
+Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
 cargo build --release --workspace --manifest-path "$root\Cargo.toml"
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
