@@ -26,5 +26,7 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 Export-Certificate -Cert $cert -FilePath "$out\nookery.cer" | Out-Null
 
-& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DVersion=$version" "/DCertThumb=$($cert.Thumbprint)" "$root\installer\nookery.iss"
+# Inno Setup 可能装在全机或当前用户目录下
+$iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+& $iscc /Q "/DVersion=$version" "/DCertThumb=$($cert.Thumbprint)" "$root\installer\nookery.iss"
 exit $LASTEXITCODE
