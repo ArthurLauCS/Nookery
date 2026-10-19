@@ -1,10 +1,8 @@
 //! 和资源管理器打交道：图标、右键菜单、拖放、文件移动、桌面监听。
 
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU32};
-use std::time::{Duration, SystemTime};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -32,11 +30,20 @@ pub fn wpath(p: &Path) -> Vec<u16> {
 }
 
 pub fn desktop_dir() -> PathBuf {
+    known_dir(&FOLDERID_Desktop).expect("找不到桌面目录")
+}
+
+/// 所有用户共用的桌面（C:\Users\Public\Desktop），安装程序常把快捷方式放这里
+pub fn public_desktop_dir() -> Option<PathBuf> {
+    known_dir(&FOLDERID_PublicDesktop)
+}
+
+fn known_dir(id: &GUID) -> Option<PathBuf> {
     unsafe {
-        let p = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None).expect("找不到桌面目录");
+        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
         let s = p.to_string().unwrap_or_default();
         CoTaskMemFree(Some(p.0 as _));
-        PathBuf::from(s)
+        Some(PathBuf::from(s))
     }
 }
 
@@ -60,35 +67,37 @@ fn desktop_listview() -> Option<HWND> {
     }
 }
 
-/// 用户正在桌面上给图标改名（列表里有编辑框）时不归类，否则“新建文件夹”还没起好名字就被拿走了
-pub fn label_editing() -> bool {
-    desktop_listview().is_some_and(|lv| unsafe { FindWindowExW(Some(lv), None, w!("Edit"), PCWSTR::null()).is_ok() })
+/// 资源管理器的桌面图标整体显示 / 隐藏，和桌面右键“查看 → 显示桌面图标”是同一个开关（资源管理器自己记住状态）
+pub fn show_icons(show: bool) {
+    // 桌面窗口里“显示桌面图标”菜单项的命令号，发一次切换一次
+    const TOGGLE_ICONS: usize = 0x7402;
+    let Some(lv) = desktop_listview() else { return };
+    unsafe {
+        if IsWindowVisible(lv).as_bool() != show {
+            if let Ok(def) = GetParent(lv) {
+                let _ = PostMessageW(Some(def), WM_COMMAND, WPARAM(TOGGLE_ICONS), LPARAM(0));
+            }
+        }
+    }
 }
 
-/// 这一点是不是桌面空白处：点在桌面图标列表上，且没有选中任何图标（点空白会清空选中）
+/// 这一点是不是桌面空白处：桌面图标隐藏时点到的是图标列表背后的桌面窗口；
+/// 图标显示时要点在列表上，且没有选中任何图标（点空白会清空选中）
 pub fn desktop_blank_at(pt: POINT) -> bool {
     const LVM_GETSELECTEDCOUNT: u32 = 0x1032;
     let Some(lv) = desktop_listview() else { return false };
     let mut n = 1usize;
     unsafe {
-        WindowFromPoint(pt) == lv
-            && SendMessageTimeoutW(lv, LVM_GETSELECTEDCOUNT, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 200, Some(&mut n)).0 != 0
-            && n == 0
+        let w = WindowFromPoint(pt);
+        if !IsWindowVisible(lv).as_bool() {
+            return GetParent(lv).is_ok_and(|def| w == def);
+        }
+        w == lv && SendMessageTimeoutW(lv, LVM_GETSELECTEDCOUNT, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 200, Some(&mut n)).0 != 0 && n == 0
     }
 }
 
-/// 3 秒内没改动、并且能独占打开，才算写完。
-/// OneDrive 只在云端的占位文件不去打开（一打开就会触发下载），直接算稳定
-pub fn is_stable(path: &Path, md: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    let modified = md.modified().unwrap_or(SystemTime::now());
-    let quiet = SystemTime::now().duration_since(modified).map_or(true, |d| d >= Duration::from_secs(3));
-    let cloud = FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0 | FILE_ATTRIBUTE_RECALL_ON_OPEN.0 | FILE_ATTRIBUTE_OFFLINE.0;
-    quiet && (md.is_dir() || md.file_attributes() & cloud != 0 || std::fs::OpenOptions::new().read(true).share_mode(0).open(path).is_ok())
-}
-
-/// 移进 dir，重名时依次改成“名字 (2)”“名字 (3)”…；不覆盖已有文件
-pub fn move_unique(src: &Path, dir: &Path) -> bool {
+/// 移进 dir，重名时依次改成“名字 (2)”“名字 (3)”…；不覆盖已有文件。返回移到的位置
+pub fn move_unique(src: &Path, dir: &Path) -> Option<PathBuf> {
     let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 && !src.is_dir() => (&name[..i], &name[i..]),
@@ -99,12 +108,29 @@ pub fn move_unique(src: &Path, dir: &Path) -> bool {
         let dst = if n == 1 { dir.join(&name) } else { dir.join(format!("{stem} ({n}){ext}")) };
         let to = wpath(&dst);
         match unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVE_FILE_FLAGS(0)) } {
-            Ok(()) => return true,
+            Ok(()) => return Some(dst),
             Err(e) if e.code() == ERROR_ALREADY_EXISTS.to_hresult() || e.code() == ERROR_FILE_EXISTS.to_hresult() => {}
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
-    false
+    None
+}
+
+/// 拖放数据或剪贴板里的文件路径
+pub fn hdrop_files(d: &IDataObject) -> Vec<PathBuf> {
+    let fmt = FORMATETC { cfFormat: CF_HDROP.0, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+    unsafe {
+        let Ok(mut m) = d.GetData(&fmt) else { return Vec::new() };
+        let files = hdrop_paths(HDROP(m.u.hGlobal.0));
+        ReleaseStgMedium(&mut m);
+        files
+    }
+}
+
+/// 剪贴板里复制 / 剪切的文件的名字
+pub fn clipboard_names() -> Vec<String> {
+    let files = unsafe { OleGetClipboard() }.map(|d| hdrop_files(&d)).unwrap_or_default();
+    files.iter().filter_map(|f| f.file_name()).map(|n| n.to_string_lossy().to_string()).collect()
 }
 
 pub fn hdrop_paths(hdrop: HDROP) -> Vec<PathBuf> {
@@ -135,9 +161,35 @@ pub fn drop_files(hwnd: HWND, files: &[PathBuf], dir: &Path, copy: bool) {
     unsafe { SHFileOperationW(&mut op) };
 }
 
+/// 打开文件、文件夹或系统图标（::{CLSID}）
 pub fn open(path: &Path) {
     let p = wpath(path);
-    unsafe { ShellExecuteW(None, PCWSTR::null(), PCWSTR(p.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+    unsafe {
+        let mut pidl = std::ptr::null_mut();
+        if SHParseDisplayName(PCWSTR(p.as_ptr()), None, &mut pidl, 0, None).is_err() {
+            return;
+        }
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_INVOKEIDLIST,
+            lpIDList: pidl as _,
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        let _ = ShellExecuteExW(&mut info);
+        CoTaskMemFree(Some(pidl as _));
+    }
+}
+
+/// 资源管理器里显示的名字（系统图标用）
+pub fn display_name(path: &Path) -> Option<String> {
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wpath(path).as_ptr()), None).ok()?;
+        let p = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as _));
+        s
+    }
 }
 
 /// 系统图标或缩略图，转成 D2D 位图
@@ -192,25 +244,26 @@ fn to_bitmap(rt: &ID2D1RenderTarget, f: &IShellItemImageFactory, px: i32, flags:
     }
 }
 
-/// 没有文件路径的系统项（此电脑、回收站、控制面板等）在 dir 里建一个指向它的快捷方式，重名时加序号
-pub fn make_link(item: &IShellItem, dir: &Path) {
+/// 没有文件路径的系统项（控制面板里的某一项等）在 dir 里建一个指向它的快捷方式，重名时加序号；返回快捷方式的文件名
+pub fn make_link(item: &IShellItem, dir: &Path) -> Option<String> {
     unsafe {
-        let Ok(link) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) else { return };
-        let Ok(pidl) = SHGetIDListFromObject(item) else { return };
+        let link = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let pidl = SHGetIDListFromObject(item).ok()?;
         let _ = link.SetIDList(pidl);
         CoTaskMemFree(Some(pidl as _));
-        let Ok(name) = item.GetDisplayName(SIGDN_NORMALDISPLAY) else { return };
+        let name = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
         let mut stem = name.to_string().unwrap_or_default();
         CoTaskMemFree(Some(name.0 as _));
         stem.retain(|c| !r#"\/:*?"<>|"#.contains(c));
-        let Ok(file) = link.cast::<IPersistFile>() else { return };
+        let file = link.cast::<IPersistFile>().ok()?;
         for n in 1..100 {
-            let dst = if n == 1 { dir.join(format!("{stem}.lnk")) } else { dir.join(format!("{stem} ({n}).lnk")) };
+            let f = if n == 1 { format!("{stem}.lnk") } else { format!("{stem} ({n}).lnk") };
+            let dst = dir.join(&f);
             if !dst.exists() {
-                let _ = file.Save(PCWSTR(wpath(&dst).as_ptr()), true);
-                return;
+                return file.Save(PCWSTR(wpath(&dst).as_ptr()), true).ok().map(|_| f);
             }
         }
+        None
     }
 }
 
@@ -248,7 +301,39 @@ pub fn show_desktop_icon(clsid: &str, show: bool) {
     }
 }
 
-/// 一个目录下若干项的 Shell 对象：右键菜单、拖拽数据都从这里取
+/// 桌面上显示的系统图标（“桌面图标设置”里勾选的）的 CLSID；没设置过时回收站默认显示
+pub fn desktop_icons() -> Vec<String> {
+    const RECYCLE_BIN: &str = "{645FF040-5081-101B-9F08-00AA002F954E}";
+    let mut ids = Vec::new();
+    let mut seen_bin = false;
+    unsafe {
+        let mut key = HKEY::default();
+        let path = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel");
+        if RegOpenKeyExW(HKEY_CURRENT_USER, path, None, KEY_READ, &mut key) == ERROR_SUCCESS {
+            for i in 0.. {
+                let (mut name, mut n) = ([0u16; 64], 64u32);
+                let (mut v, mut vn) = (1u32, 4u32);
+                if RegEnumValueW(key, i, Some(PWSTR(name.as_mut_ptr())), &mut n, None, None, Some(&mut v as *mut u32 as _), Some(&mut vn)) != ERROR_SUCCESS {
+                    break;
+                }
+                let id = String::from_utf16_lossy(&name[..n as usize]);
+                seen_bin |= id.eq_ignore_ascii_case(RECYCLE_BIN);
+                if v == 0 {
+                    ids.push(id);
+                }
+            }
+            let _ = RegCloseKey(key);
+        }
+    }
+    if !seen_bin {
+        ids.push(RECYCLE_BIN.into());
+    }
+    // 只留解析得出来的（聚焦壁纸的“了解此图片”等不一定在）
+    ids.retain(|id| display_name(Path::new(&format!("::{id}"))).is_some());
+    ids
+}
+
+/// 若干项的 Shell 对象：右键菜单、拖拽数据都从这里取
 pub struct Items {
     folder: IShellFolder,
     pidls: Vec<*mut ITEMIDLIST>,
@@ -274,11 +359,19 @@ pub fn folder(dir: &Path) -> Option<IShellFolder> {
 }
 
 impl Items {
-    pub fn new(hwnd: HWND, dir: &Path, names: &[String]) -> Option<Items> {
-        let folder = folder(dir)?;
+    /// 系统图标（::{CLSID}）挂在桌面根下，文件挂在各自目录下。Shell 对象要求同一父级，
+    /// 选中的项不在同一处时（如回收站加一个文件）只取和第一项同处的
+    pub fn new(hwnd: HWND, paths: &[&Path]) -> Option<Items> {
+        let parent = |p: &Path| if p.to_string_lossy().starts_with("::") { None } else { p.parent().map(Path::to_path_buf) };
+        let base = parent(paths.first()?);
+        let folder = match &base {
+            Some(d) => folder(d)?,
+            None => unsafe { SHGetDesktopFolder().ok()? },
+        };
         let mut it = Items { folder, pidls: Vec::new() };
-        for n in names {
-            let w = wide(n);
+        for p in paths.iter().filter(|p| parent(p) == base) {
+            let n = if base.is_some() { p.file_name()?.to_string_lossy() } else { p.to_string_lossy() };
+            let w = wide(&n);
             let mut pidl = std::ptr::null_mut();
             unsafe {
                 it.folder.ParseDisplayName(hwnd, None, PCWSTR(w.as_ptr()), None, &mut pidl, std::ptr::null_mut()).ok()?;
@@ -443,5 +536,29 @@ pub fn watch_dblclick(notify: HWND) -> u32 {
 pub fn stop_thread(tid: u32) {
     unsafe {
         let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回收站和文件各自取得到右键菜单；混在一起选时只取和第一项同处的
+    #[test]
+    fn system_icon_and_file_items() {
+        unsafe {
+            let _ = OleInitialize(None);
+        }
+        let bin = Path::new("::{645FF040-5081-101B-9F08-00AA002F954E}");
+        assert!(display_name(bin).is_some_and(|n| !n.is_empty()));
+        let f = std::env::temp_dir().join("nookery-items-test.txt");
+        std::fs::write(&f, "x").unwrap();
+        let mixed = Items::new(HWND::default(), &[bin, &f]).unwrap();
+        assert_eq!(mixed.pidls.len(), 1);
+        assert!(mixed.menu(HWND::default()).is_some());
+        let file = Items::new(HWND::default(), &[&f, &f]).unwrap();
+        assert_eq!(file.pidls.len(), 2);
+        assert!(file.menu(HWND::default()).is_some());
+        let _ = std::fs::remove_file(&f);
     }
 }

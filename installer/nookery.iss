@@ -66,16 +66,16 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Com
 Filename: "{app}\nookery.exe"; Description: "{cm:LaunchProgram,Nookery}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; 先结束程序，免得刚放回桌面的文件又被收进磁贴；右键菜单 DLL 在 dllhost 里，也要结束才删得掉
+; 先结束程序（强制结束时桌面图标还关着，下面的 --uninstall 打开）；右键菜单 DLL 在 dllhost 里，也要结束才删得掉
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM nookery.exe"; Flags: runhidden; RunOnceId: "Kill"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM dllhost.exe /FI ""MODULES eq nookery_menu.dll"""; Flags: runhidden; RunOnceId: "KillMenu"
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Get-AppxPackage Nookery | Remove-AppxPackage"""; Flags: runhidden; RunOnceId: "Package"
-; 文件全部放回桌面，删开机自启和老式右键菜单
+; 恢复桌面图标，删开机自启和老式右键菜单
 Filename: "{app}\nookery.exe"; Parameters: "--uninstall"; RunOnceId: "Restore"
 Filename: "{sys}\certutil.exe"; Parameters: "-delstore TrustedPeople {#CertThumb}"; Verb: "runas"; Flags: shellexec runhidden waituntilterminated; RunOnceId: "Cert"
 
 [UninstallDelete]
-; 配置一起删，重装后第一次运行会重新确认要不要整理桌面
+; 配置一起删
 Type: filesandordirs; Name: "{userappdata}\Nookery"
 
 [Code]

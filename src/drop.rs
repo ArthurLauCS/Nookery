@@ -1,6 +1,7 @@
-//! 拖进磁贴：OLE 拖放目标。拖过时高亮磁贴、显示系统拖拽缩略图，松手后移动或复制进磁贴目录。
+//! 拖进磁贴：OLE 拖放目标。拖过时高亮磁贴、显示系统拖拽缩略图。
+//! 桌面上的项只记下放进了哪块磁贴，文件不动；别处的文件移动或复制到桌面目录，
 //! 规则和资源管理器一样：同盘移动、跨盘复制，按住 Ctrl 复制、按住 Shift 移动。
-//! 在磁贴内拖动是排序；此电脑、回收站这类没有文件路径的系统项建快捷方式。
+//! 在磁贴内拖动是排序；此电脑、回收站这类没有文件路径的系统项由磁贴显示。
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT, MODIFIERKEYS_
 use windows::Win32::UI::Shell::*;
 use windows::core::*;
 
+use crate::shell::{desktop_clsid, hdrop_files};
 use crate::tile::Tile;
 use crate::{app, same_path};
 
@@ -21,16 +23,6 @@ struct Target {
     files: RefCell<Vec<PathBuf>>,
     /// 拖来的系统项（没有文件路径）
     links: RefCell<Vec<IShellItem>>,
-}
-
-fn hdrop_files(d: &IDataObject) -> Vec<PathBuf> {
-    let fmt = FORMATETC { cfFormat: CF_HDROP.0, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
-    unsafe {
-        let Ok(mut m) = d.GetData(&fmt) else { return Vec::new() };
-        let files = crate::shell::hdrop_paths(HDROP(m.u.hGlobal.0));
-        ReleaseStgMedium(&mut m);
-        files
-    }
 }
 
 /// 数据里没有文件路径的 Shell 项：从桌面拖来的此电脑、回收站等不带 CF_HDROP，只有 Shell 项列表
@@ -55,24 +47,28 @@ impl Target {
         unsafe { &mut *self.tile }
     }
 
-    /// 拖的全是本磁贴里的项：排序
-    fn inside(&self) -> bool {
-        let files = self.files.borrow();
-        let dir = self.tile().dir(app());
-        !files.is_empty() && files.iter().all(|f| f.parent().is_some_and(|p| same_path(p, &dir)))
+    /// 拖的项在本磁贴里的名字；有一项不在本磁贴就是 None
+    fn inside(&self) -> Option<Vec<String>> {
+        let (files, links, items) = (self.files.borrow(), self.links.borrow(), &self.tile().items);
+        let names: Vec<String> = if files.is_empty() {
+            links.iter().filter_map(|l| desktop_clsid(l).map(|id| format!("::{id}"))).collect()
+        } else {
+            files.iter().filter_map(|f| items.iter().find(|it| same_path(&it.path, f)).map(|it| it.name.clone())).collect()
+        };
+        (!names.is_empty() && names.len() == files.len().max(links.len()) && names.iter().all(|n| items.iter().any(|it| it.name == *n))).then_some(names)
     }
 
     fn effect(&self, keys: MODIFIERKEYS_FLAGS) -> DROPEFFECT {
+        if self.inside().is_some() {
+            return DROPEFFECT_MOVE;
+        }
         if !self.links.borrow().is_empty() {
             return DROPEFFECT_LINK;
         }
         let files = self.files.borrow();
-        let dir = self.tile().dir(app());
+        let dir = &app().root;
         if files.is_empty() {
             return DROPEFFECT_NONE;
-        }
-        if self.inside() {
-            return DROPEFFECT_MOVE;
         }
         let same_volume = files.iter().all(|f| f.components().next() == dir.components().next());
         if keys.0 & MK_CONTROL.0 != 0 {
@@ -87,7 +83,7 @@ impl Target {
     /// 外面拖进来高亮整块磁贴；磁贴内排序只画插入线
     fn hover(&self, e: DROPEFFECT, pt: &POINTL) {
         let t = self.tile();
-        let (hot, slot) = match (e != DROPEFFECT_NONE, self.inside()) {
+        let (hot, slot) = match (e != DROPEFFECT_NONE, self.inside().is_some()) {
             (true, true) => (false, Some(t.slot_at(pt.x, pt.y))),
             (on, _) => (on, None),
         };
@@ -141,8 +137,9 @@ impl IDropTarget_Impl for Target_Impl {
         let e = self.effect(keys);
         let inside = self.inside();
         unsafe {
-            // 排序不动文件，告诉拖动源什么都没做
-            *effect = if inside { DROPEFFECT_NONE } else { e };
+            // 排序、桌面上的项换磁贴都不动文件：告诉拖动源什么都没做，免得它当成移动把原文件删掉
+            let a = app();
+            *effect = if inside.is_some() || self.files.borrow().iter().any(|f| a.on_desk(f)) { DROPEFFECT_NONE } else { e };
             if let (Some(h), Ok(obj)) = (&app().drop_helper, obj.ok()) {
                 let _ = h.Drop(obj, &POINT { x: pt.x, y: pt.y }, e);
             }
@@ -151,13 +148,10 @@ impl IDropTarget_Impl for Target_Impl {
         let t = self.tile();
         let files = std::mem::take(&mut *self.files.borrow_mut());
         let links = std::mem::take(&mut *self.links.borrow_mut());
-        if inside {
-            let moved: Vec<String> = files.iter().filter_map(|f| f.file_name()).map(|n| n.to_string_lossy().to_string()).collect();
+        if let Some(moved) = inside {
             app().reorder(t, &moved, t.slot_at(pt.x, pt.y));
         } else if !links.is_empty() {
-            let dir = t.dir(app());
-            let _ = std::fs::create_dir_all(&dir);
-            links.iter().for_each(|it| crate::shell::make_link(it, &dir));
+            app().link_into(t, &links);
         } else if e != DROPEFFECT_NONE {
             app().drop_into(t, files, e == DROPEFFECT_COPY);
         }
