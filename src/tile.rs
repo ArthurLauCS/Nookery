@@ -1,6 +1,6 @@
 //! 磁贴窗口：绘制和交互。尺寸常量都是 DIP，绘制时由渲染目标按窗口 DPI 缩放。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use windows::Win32::Foundation::*;
@@ -51,8 +51,18 @@ enum Btn {
     Lock,
 }
 
+/// 桌面上的一项：name 是它在桌面上的名字（系统图标是 ::{CLSID}），path 用来取图标、打开、右键
+#[derive(Clone)]
+pub struct Entry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub mtime: SystemTime,
+}
+
 pub struct Item {
     pub name: String,
+    pub path: PathBuf,
     pub is_dir: bool,
     pub mtime: SystemTime,
     icon: Option<ID2D1Bitmap>,
@@ -236,10 +246,6 @@ impl Tile {
         }
     }
 
-    pub fn dir(&self, a: &App) -> PathBuf {
-        a.data.join(&self.name)
-    }
-
     pub fn invalidate(&self) {
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
@@ -247,18 +253,17 @@ impl Tile {
     }
 
     /// 内容变了才重建列表，图标按（名字，修改时间）复用
-    pub fn set_items(&mut self, list: Vec<(String, bool, SystemTime)>) {
-        let same = list.len() == self.items.len()
-            && list.iter().zip(&self.items).all(|((n, _, m), it)| *n == it.name && *m == it.mtime);
+    pub fn set_items(&mut self, list: Vec<Entry>) {
+        let same = list.len() == self.items.len() && list.iter().zip(&self.items).all(|(e, it)| e.name == it.name && e.mtime == it.mtime);
         if same {
             return;
         }
         let mut old: Vec<Item> = std::mem::take(&mut self.items);
         self.items = list
             .into_iter()
-            .map(|(name, is_dir, mtime)| match old.iter().position(|o| o.name == name && o.mtime == mtime) {
+            .map(|Entry { name, path, is_dir, mtime }| match old.iter().position(|o| o.name == name && o.mtime == mtime) {
                 Some(i) => old.swap_remove(i),
-                None => Item { name, is_dir, mtime, icon: None, icon_tried: false, layout: None },
+                None => Item { name, path, is_dir, mtime, icon: None, icon_tried: false, layout: None },
             })
             .collect();
         self.sel.retain(|s| self.items.iter().any(|it| it.name == *s));
@@ -335,11 +340,14 @@ impl Tile {
         }
     }
 
-    fn display_name<'n>(a: &App, it: &'n Item) -> &'n str {
+    fn display_name(a: &App, it: &Item) -> String {
+        if it.name.starts_with("::") {
+            return shell::display_name(&it.path).unwrap_or_default();
+        }
         match it.name.rfind('.') {
-            // 快捷方式和桌面上一样总是不显示扩展名
-            Some(i) if !it.is_dir && i > 0 && (a.hide_ext || it.name[i..].eq_ignore_ascii_case(".lnk")) => &it.name[..i],
-            _ => &it.name,
+            // 快捷方式和网址和桌面上一样总是不显示扩展名
+            Some(i) if !it.is_dir && i > 0 && (a.hide_ext || [".lnk", ".url"].iter().any(|x| it.name[i..].eq_ignore_ascii_case(x))) => it.name[..i].to_string(),
+            _ => it.name.clone(),
         }
     }
 
@@ -362,13 +370,13 @@ impl Tile {
         }
         self.painting = true;
         let (w, h) = self.size_dip();
-        let (s, dir) = (scale(self.hwnd), self.dir(a));
+        let s = scale(self.hwnd);
         for i in 0..self.items.len() {
             let r = self.item_rect(i, w);
             let it = &mut self.items[i];
             if !it.icon_tried && r.bottom >= TITLE_H && r.top <= h {
                 it.icon_tried = true;
-                it.icon = shell::load_icon(&a.gfx.dc, &dir.join(&it.name), (ICON * s) as i32);
+                it.icon = shell::load_icon(&a.gfx.dc, &it.path, (ICON * s) as i32);
             }
         }
         self.draw(a);
@@ -478,7 +486,7 @@ impl Tile {
                         rt.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None);
                     }
                     if it.layout.is_none() {
-                        let t = u16s(Self::display_name(a, it));
+                        let t = u16s(&Self::display_name(a, it));
                         it.layout = a.dw.CreateTextLayout(&t, &a.fmt_label, cw - 8.0, LABEL_H).ok();
                     }
                     if let Some(l) = &it.layout {
@@ -550,8 +558,9 @@ impl Tile {
         (0..self.items.len()).filter(|i| self.sel.contains(&self.items[*i].name)).collect()
     }
 
-    fn sel_items(&self, a: &App) -> Option<Items> {
-        Items::new(self.hwnd, &self.dir(a), &self.sel)
+    fn sel_items(&self) -> Option<Items> {
+        let paths: Vec<&Path> = self.selected_idx().into_iter().map(|i| self.items[i].path.as_path()).collect();
+        Items::new(self.hwnd, &paths)
     }
 
     /// 标题栏上按下：按钮直接生效；名字上单击改名；按住拖动移动磁贴（自己捕获鼠标处理，见 drag_to）
@@ -675,7 +684,7 @@ impl Tile {
                 self.press = None;
             } else if (p.x - p0.x).abs() > dx || (p.y - p0.y).abs() > dy {
                 self.press = None;
-                if let Some(items) = self.sel_items(a) {
+                if let Some(items) = self.sel_items() {
                     items.drag(self.hwnd);
                 }
             }
@@ -695,25 +704,28 @@ impl Tile {
         }
     }
 
-    fn open_selected(&self, a: &App) {
-        let dir = self.dir(a);
+    fn open_selected(&self) {
         for i in self.selected_idx() {
-            shell::open(&dir.join(&self.items[i].name));
+            shell::open(&self.items[i].path);
         }
     }
 
-    fn verb(&self, a: &App, verb: &str) {
-        if let Some(cm) = self.sel_items(a).and_then(|it| it.menu(self.hwnd)) {
+    fn verb(&self, verb: &str) {
+        if let Some(cm) = self.sel_items().and_then(|it| it.menu(self.hwnd)) {
             shell::invoke_verb(&cm, self.hwnd, verb, key_down(VK_SHIFT));
         }
     }
 
-    fn paste(&self, a: &App) {
-        let dir = self.dir(a);
-        let _ = std::fs::create_dir_all(&dir);
-        if let Some(cm) = shell::background_menu(self.hwnd, &dir) {
+    /// 粘贴到桌面目录，剪贴板里的这些名字记到本磁贴
+    fn paste(&self, a: &mut App) {
+        let names = shell::clipboard_names();
+        if let Some(cm) = shell::background_menu(self.hwnd, &a.root) {
             shell::invoke_verb(&cm, self.hwnd, "paste", false);
         }
+        for n in &names {
+            a.cfg.set_map(n, &self.name);
+        }
+        a.save();
     }
 
     /// 方向键像资源管理器一样移动选中项，并把它滚进可视区
@@ -752,16 +764,16 @@ impl Tile {
                     self.start_rename(a, Some(i));
                 }
             }
-            VK_DELETE => self.verb(a, "delete"),
-            VK_RETURN => self.open_selected(a),
+            VK_DELETE => self.verb("delete"),
+            VK_RETURN => self.open_selected(),
             VK_F5 => a.rescan(),
             VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END => self.move_focus(VIRTUAL_KEY(vk)),
             VK_A if ctrl => {
                 self.sel = self.items.iter().map(|it| it.name.clone()).collect();
                 self.invalidate();
             }
-            VK_C if ctrl => self.verb(a, "copy"),
-            VK_X if ctrl => self.verb(a, "cut"),
+            VK_C if ctrl => self.verb("copy"),
+            VK_X if ctrl => self.verb("cut"),
             VK_V if ctrl => self.paste(a),
             _ => {}
         }
@@ -781,7 +793,7 @@ impl Tile {
             self.sel = vec![self.items[i].name.clone()];
             self.invalidate();
         }
-        let Some(cm) = self.sel_items(a).and_then(|it| it.menu(self.hwnd)) else { return };
+        let Some(cm) = self.sel_items().and_then(|it| it.menu(self.hwnd)) else { return };
         if let Picked::Rename = shell::track_menu(&cm, self.hwnd, screen, &mut a.menu2) {
             self.start_rename(a, Some(i));
         }
@@ -790,16 +802,12 @@ impl Tile {
     /// 标题栏或空白处右键：只留打开所在文件夹和删除磁贴
     fn tile_menu(&mut self, a: &mut App, pt: POINT) {
         match popup(self.hwnd, pt, &[(3, tr("在资源管理器中打开", "Open in File Explorer")), (0, ""), (5, tr("删除磁贴", "Delete tile"))]) {
-            3 => {
-                let dir = self.dir(a);
-                let _ = std::fs::create_dir_all(&dir);
-                shell::open(&dir);
-            }
+            3 => shell::open(&a.root),
             5 => {
                 let msg = shell::wide(&if crate::lang::en() {
-                    format!("Delete tile \"{}\"? Its files will go back to the desktop and be sorted again by the rules.", self.name)
+                    format!("Delete tile \"{}\"? Its items will be sorted into other tiles by the rules. Files are not touched.", self.name)
                 } else {
-                    format!("删除磁贴「{}」？里面的文件会放回桌面，再按规则归类。", self.name)
+                    format!("删除磁贴「{}」？里面的项会按规则分到其他磁贴，文件不动。", self.name)
                 });
                 let ok = unsafe { MessageBoxW(Some(self.hwnd), PCWSTR(msg.as_ptr()), w!("Nookery"), MB_YESNO | MB_ICONQUESTION) } == IDYES;
                 if ok {
@@ -815,6 +823,10 @@ impl Tile {
     /// 改名框：无边框、颜色跟主题（WM_CTLCOLOREDIT 里设）；点别处失去焦点即保存
     pub fn start_rename(&mut self, a: &App, item: Option<usize>) {
         self.finish_rename(false);
+        // 系统图标不改名
+        if item.is_some_and(|i| self.items[i].name.starts_with("::")) {
+            return;
+        }
         let (w, _) = self.size_dip();
         let s = scale(self.hwnd);
         let (r, text, font) = match item {
@@ -1034,7 +1046,7 @@ pub unsafe extern "system" fn tile_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     t.on_down(a, lp);
                 } else {
                     t.press = None;
-                    t.open_selected(a);
+                    t.open_selected();
                 }
             }
             WM_RBUTTONUP => t.on_rclick(a, lp),

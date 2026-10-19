@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Desktop tiles for Windows 11. Loose files on your desktop (folders, documents, pictures, ...) are automatically sorted by type into tiles. Shortcuts stay on the desktop.
+Desktop tiles for Windows 11. Everything on your desktop (shortcuts, folders, documents, pictures, ...) is shown in tiles by type. Files never move: open the Desktop folder in File Explorer and everything is still there.
 
 - A single ~430 KB exe, 12–14 MB private memory, 0% CPU when idle.
 - Five tile opacity levels, down to fully transparent with only a faint border; follows the system light/dark theme.
@@ -16,19 +16,20 @@ Download `Nookery-Setup-<version>.exe` from [Releases](https://github.com/Arthur
 - The installer is not signed with a commercial code-signing certificate, so Windows may show "Windows protected your PC". Click **More info** → **Run anyway**.
 - Setup asks for administrator permission once, to install the certificate for the desktop context menu. If you decline, Nookery still works, but **New tile** is only under **Show more options** in the desktop right-click menu.
 - The language you pick in setup is also Nookery's interface language. You can change it later from the tray menu.
-- On first run, Nookery tells you how many items it will sort and waits for your confirmation.
 
-## Where your files go
+## Where your files are
 
-- Sorted files are moved to `Desktop\.Nookery\<tile name>\` (a hidden system folder). They are still inside your desktop folder, so OneDrive desktop sync keeps working.
-- Settings are in `%APPDATA%\Nookery\config.txt`: tile positions, lock/collapse state, rules, opacity, pause state.
-- Create a folder inside `.Nookery` and it becomes a tile.
-- Uninstalling (installed version) stops Nookery, moves every file back to the desktop, and removes autostart, the context menu entry, the certificate, the language setting and the config. If you run the exe directly, click **Restore all to desktop** in the tray menu before deleting it.
+- Files stay in your Desktop folder; paths never change. Tiles only display them, so File Explorer, OneDrive desktop sync and recent-file lists all keep working.
+- While Nookery runs, File Explorer's own desktop icons are turned off (the same switch as right-click the desktop → **View** → **Show desktop icons**), and everything on the desktop is shown in tiles instead: your files, the shortcuts installers put on the Public desktop, and the system icons (This PC, Recycle Bin, ...) enabled in **Desktop icon settings**. Exiting Nookery turns the desktop icons back on. If Nookery crashes, they stay off until you start it again or turn **Show desktop icons** back on.
+- Settings are in `%APPDATA%\Nookery\config.txt`: tile positions, lock/collapse state, rules, which tile each item you placed by hand belongs to (`map` lines), opacity.
+- Versions up to 0.2 moved sorted files into `Desktop\.Nookery\<tile name>\`. On first start, Nookery moves them back to the desktop (adding " (2)" on name clashes) and keeps each one in the tile it was in.
+- Uninstalling (installed version) stops Nookery, turns the desktop icons back on, and removes autostart, the context menu entry, the certificate, the language setting and the config.
 
 ## Sorting rules
 
 | Tile | Contents |
 |---|---|
+| Shortcuts | lnk url appref-ms website, and system icons like This PC and Recycle Bin |
 | Folders | Folders |
 | Documents | doc docx pdf txt md rtf odt xls xlsx csv ppt pptx wps et dps |
 | Pictures | png jpg jpeg gif webp bmp svg heic ico psd |
@@ -38,17 +39,17 @@ Download `Nookery-Setup-<version>.exe` from [Releases](https://github.com/Arthur
 | Programs | exe msi |
 | Others | Everything else |
 
-Left on the desktop:
+Not shown in any tile (still in the Desktop folder):
 
-- Shortcuts (`.lnk` `.url` `.appref-ms` `.website`)
 - Hidden and system files
 - Downloads in progress (`.crdownload`, `.part`, ...)
 - Office lock files (starting with `~$`)
+- Files no rule matches, if you deleted the Others tile
 
-A file is moved only after it has been unchanged for 3 seconds and can be opened exclusively, and never while you are renaming an icon on the desktop.
+New files show up in their tile right away.
 
-- **Change a rule**: drag a file from one tile to another; Nookery asks whether that extension should always go to the new tile.
-- **Keep on desktop**: a file dragged from a tile back to the desktop stays there (recorded as `keep` in the config). The record is cleared when the file is deleted or renamed.
+- **Place by hand**: drag an item from one tile to another. Nookery remembers the tile (a `map` line in the config); the file itself doesn't move. Renaming a file in a tile keeps it there, even if the new extension belongs to another tile. Renaming it in File Explorer sends it back to the tile its rule picks.
+- **Change a rule**: drag files of one type from one tile to another; Nookery asks whether that extension should always go to the new tile.
 
 ## Tile title bar
 
@@ -76,7 +77,7 @@ At 50% and below, text sits directly on the wallpaper and uses white text with a
 English / Chinese. Switch under **Language** in the tray menu (in Chinese it reads "语言/Language", and the options are "中文/Chinese" and "English", so you can always find your way back). The setting is stored as `Language` under `HKCU\Software\Nookery`; if never set, Nookery follows the Windows display language. After switching:
 
 - Menus, messages and dialogs change immediately.
-- Default tiles (Folders, Documents, Pictures, ...) are renamed along with their folders. Tiles you renamed or created are left alone, as is any tile whose new name is already taken.
+- Default tiles (Shortcuts, Folders, Documents, ...) are renamed. Tiles you renamed or created are left alone, as is any tile whose new name is already taken.
 - **New tile** in the desktop context menu follows the new language.
 
 ## Controls
@@ -88,17 +89,18 @@ English / Chinese. Switch under **Language** in the tray menu (in Chinese it rea
 | Right-click a file | System context menu |
 | F2 | Rename |
 | Delete (Shift+Delete) | Move to Recycle Bin (delete permanently) |
-| Ctrl+A / C / X / V | Select all / copy / cut / paste |
-| Drag out / drag in | Same as File Explorer: move on the same drive, copy across drives; hold Ctrl to copy, Shift to move; the target tile highlights |
+| Ctrl+A / C / X / V | Select all / copy / cut / paste (pasted files go to the Desktop folder and show up in this tile) |
+| Drag between tiles | Moves the item to the other tile; the file stays where it is |
+| Drag in from elsewhere | Same as File Explorer: move on the same drive, copy across drives into the Desktop folder; hold Ctrl to copy, Shift to move. The files show up in this tile; the target tile highlights |
 | Drag an icon within a tile | Reorder; a line marks where it will land, and the order is remembered |
-| Drag This PC, Recycle Bin, etc. from the desktop into a tile | Adds a shortcut to the tile and hides the original desktop icon; the icon comes back once the shortcut leaves every tile (deleted, dragged back to the desktop, tile deleted, restore all, uninstall) |
+| Drag This PC, Recycle Bin, etc. (from File Explorer's navigation pane) into a tile | Turns that icon on in **Desktop icon settings** and shows it in this tile |
 | Drag the title bar | Move anywhere; snaps within 8 px of screen edges and other tiles, hold Alt to disable snapping |
 | Drag an edge | Resize, with the same snapping; minimum height is one row of icons |
-| Right-click the title bar or empty space | Open in File Explorer, Delete tile |
+| Right-click the title bar or empty space | Open the Desktop folder in File Explorer, Delete tile (its items go to other tiles by the rules) |
 | Right-click the desktop → New tile | Creates a tile where you clicked and starts renaming it. In the first-level Windows 11 menu for the installed version; under **Show more options** (or Shift+right-click) when running the exe directly |
 | Double-click empty desktop space | Hide / show all tiles, with a hint above the cursor |
 | Left-click the tray icon | Hide / show all tiles |
-| Right-click the tray icon | New tile, Hide tiles, Double-click desktop to hide tiles (toggle), Pause auto-sorting, Tile opacity, Restore all to desktop, Start with Windows, Language, Exit |
+| Right-click the tray icon | New tile, Hide tiles, Double-click desktop to hide tiles (toggle), Tile opacity, Start with Windows, Language, Exit |
 
 Tiles are rebuilt automatically if File Explorer restarts.
 
@@ -131,8 +133,8 @@ cargo test
 The scripts in `scripts/` run end-to-end tests on a fake desktop and never touch your real one:
 
 - `setup.ps1`: creates test files in `C:\WorkFile\Temp\fakedesk`; `-Bulk 200` adds 200 more.
-- `run.ps1`: starts Nookery with `--root` pointing at the fake desktop, checks sorting, memory and CPU, and takes screenshots.
-- `interact.ps1`: sends messages to tile windows via `examples/drive.rs` to test selection, F2 rename, the collapse button, and files dragged back to the desktop.
+- `run.ps1`: starts Nookery with `--root` pointing at the fake desktop, checks that files stay put, migration of an old `.Nookery` layout, memory and CPU, and takes screenshots.
+- `interact.ps1`: sends messages to tile windows via `examples/drive.rs` to test selection, F2 rename (the file stays in its tile), and the collapse button.
 - `design.ps1 -Round N`: screenshots for design review on a busy fake wallpaper (`backdrop.ps1`), plus grayscale copies:
   - Dark 100 / 75 / 50 / 25 / 0% and light 100%.
   - Locked, collapsed, selected.
@@ -143,11 +145,11 @@ Command-line options:
 
 | Option | Purpose |
 |---|---|
-| `--root <dir>` | Use a directory instead of the desktop; config is stored there too |
+| `--root <dir>` | Use a directory instead of the desktop; config is stored in its `.Nookery` subfolder. Leaves the real desktop icons alone and shows no Public desktop or system icons |
 | `--top` | Keep tiles topmost, for screenshots |
 | `--light` / `--dark` | Force a theme |
 | `--new-tile` | New tile at the cursor; forwarded to the running instance if there is one |
-| `--uninstall` | Move all files back to the desktop, remove autostart and the context menu, then exit (called by the uninstaller after stopping the running instance); combine with `--root` to test on a fake desktop |
+| `--uninstall` | Turn the desktop icons back on, move files left by versions up to 0.2 back to the desktop, remove autostart and the context menu, then exit (called by the uninstaller after stopping the running instance) |
 
 ## License
 

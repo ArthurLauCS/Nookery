@@ -1,9 +1,10 @@
 #![windows_subsystem = "windows"]
-//! Nookery：桌面磁贴。桌面上的散文件按类型自动收进磁贴（桌面下的隐藏目录 .Nookery\<磁贴名>），快捷方式不动。
+//! Nookery：桌面磁贴。桌面上的东西按类型显示在磁贴里，文件留在桌面目录不动；
+//! 运行时关掉资源管理器自己的桌面图标，退出时打开。
 //!
-//! 参数：--root <目录> 用指定目录代替桌面（测试用，配置也放进该目录）；--top 磁贴置顶（截图走查用）；
+//! 参数：--root <目录> 用指定目录代替桌面（测试用，配置放进该目录下的 .Nookery，不碰真实桌面图标）；--top 磁贴置顶（截图走查用）；
 //! --new-tile 在鼠标处新建磁贴（桌面右键菜单调用，已在运行时转给正在运行的实例）；
-//! --uninstall 文件全部放回桌面、删掉开机自启和右键菜单后退出（卸载程序调用）。
+//! --uninstall 显示回桌面图标、删掉开机自启和右键菜单后退出（卸载程序调用）。
 
 mod drop;
 mod gfx;
@@ -37,20 +38,20 @@ use windows::core::*;
 
 use lang::tr;
 use rules::{Config, TileCfg};
-use tile::{CELL_H, PAD, TITLE_H, Tile};
+use tile::{CELL_H, Entry, PAD, TITLE_H, Tile};
 
 pub const TILE_CLASS: PCWSTR = w!("NookeryTile");
 const MAIN_CLASS: PCWSTR = w!("NookeryMain");
 const WM_APP_TRAY: u32 = WM_APP + 2;
 /// 另一个进程（桌面右键菜单）让正在运行的实例在 lparam 指的屏幕坐标处新建磁贴
 const WM_APP_NEWTILE: u32 = WM_APP + 4;
+/// 旧版把归进磁贴的文件放在桌面下的这个目录，启动时搬回桌面；--root 测试模式的配置也放这里
 const DATA_DIR: &str = ".Nookery";
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 /// 桌面空白处右键菜单里的“新建磁贴”（Win11 下在“显示更多选项”里）
 const MENU_KEY: PCWSTR = w!("Software\\Classes\\DesktopBackground\\Shell\\NookeryNew");
 const MENU_CMD_KEY: PCWSTR = w!("Software\\Classes\\DesktopBackground\\Shell\\NookeryNew\\command");
 const T_SCAN: usize = 1;
-const T_RECHECK: usize = 2;
 const OPACITY_LEVELS: [u8; 5] = [100, 75, 50, 25, 0];
 
 pub struct Theme {
@@ -78,7 +79,10 @@ pub struct Theme {
 
 pub struct App {
     pub root: PathBuf,
-    pub data: PathBuf,
+    /// 所有用户共用的桌面；测试模式没有
+    public: Option<PathBuf>,
+    /// 桌面上要显示的项和所在磁贴，每次桌面变化重扫
+    entries: Vec<(Entry, String)>,
     cfg_path: PathBuf,
     pub cfg: Config,
     main: HWND,
@@ -151,26 +155,6 @@ pub fn fit_work_area(r: &RECT) -> (i32, i32) {
 
 fn is_hidden(md: &std::fs::Metadata) -> bool {
     md.file_attributes() & (FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0) != 0
-}
-
-/// 磁贴目录里要显示的项：文件夹在前，名字按资源管理器的自然顺序
-fn list_dir(dir: &Path) -> Vec<(String, bool, SystemTime)> {
-    let mut v: Vec<_> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let md = e.metadata().ok()?;
-            (!is_hidden(&md)).then(|| (e.file_name().to_string_lossy().to_string(), md.is_dir(), md.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
-        })
-        .collect();
-    v.sort_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| {
-            let (x, y) = (shell::wide(&a.0), shell::wide(&b.0));
-            unsafe { StrCmpLogicalW(PCWSTR(x.as_ptr()), PCWSTR(y.as_ptr())) }.cmp(&0)
-        })
-    });
-    v
 }
 
 /// 托盘图标用 exe 自带的应用图标（资源号 1，见 build.rs），按系统小图标尺寸取。
@@ -300,97 +284,48 @@ impl App {
         self.cfg.tiles.iter_mut().find(|t| t.name == name)
     }
 
-    /// 把桌面上稳定下来的散文件归进磁贴，再刷新所有磁贴
+    /// 重扫桌面（自己的、公共的、系统图标），按归属和规则分到磁贴，再刷新所有磁贴
     pub fn rescan(&mut self) {
-        let mut wait = false;
-        if !self.cfg.paused {
-            if shell::label_editing() {
-                wait = true;
-            } else {
-                let mut seen = Vec::new();
-                for e in std::fs::read_dir(&self.root).into_iter().flatten().flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    let Ok(md) = e.metadata() else { continue };
-                    // 系统图标的快捷方式从磁贴拖回桌面：删掉它，下面的 sync_desk_icons 把原图标显示回来
-                    if !self.cfg.desk.is_empty() && rules::ext_of(&name) == "lnk" && shell::link_clsid(&e.path()).is_some_and(|id| self.cfg.desk.contains(&id)) {
-                        let _ = std::fs::remove_file(e.path());
-                        continue;
-                    }
-                    seen.push(name.clone());
-                    if name == DATA_DIR || self.cfg.keep.contains(&name) {
-                        continue;
-                    }
-                    let Some(tile) = rules::classify(&self.cfg, &name, md.is_dir(), is_hidden(&md)).map(str::to_string) else { continue };
-                    // 刚从磁贴拖回桌面的（磁贴列表里还有它、目录里已经没了）：用户特意放的，留在桌面
-                    if self.tiles.iter().any(|t| t.items.iter().any(|it| it.name == name) && !self.data.join(&t.name).join(&name).exists()) {
-                        self.cfg.keep.push(name);
-                        self.save();
-                        continue;
-                    }
-                    let path = e.path();
-                    if !shell::is_stable(&path, &md) {
-                        wait = true;
-                        continue;
-                    }
-                    if self.tile_cfg(&tile).is_none() {
-                        self.cfg.tiles.push(TileCfg { name: tile.clone(), rect: [0; 4], rolled: false, keep: false, locked: false, order: Vec::new() });
-                    }
-                    let dir = self.data.join(&tile);
-                    let _ = std::fs::create_dir_all(&dir);
-                    // 失败多半是文件正被占用，稍后再试
-                    wait |= !shell::move_unique(&path, &dir);
+        let mut entries: Vec<(Entry, String)> = Vec::new();
+        for dir in [Some(&self.root), self.public.as_ref()].into_iter().flatten() {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let Ok(md) = e.metadata() else { continue };
+                // 公共桌面上和自己桌面同名的项，按名字认不出是哪个，只显示自己的
+                if name == DATA_DIR || entries.iter().any(|(x, _)| x.name == name) {
+                    continue;
                 }
-                // 留在桌面的项被删掉或改名后，记录跟着清掉
-                let before = self.cfg.keep.len();
-                self.cfg.keep.retain(|k| seen.contains(k));
-                if self.cfg.keep.len() != before {
-                    self.save();
+                let Some(tile) = rules::classify(&self.cfg, &name, md.is_dir(), is_hidden(&md)) else { continue };
+                let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                entries.push((Entry { name, path: e.path(), is_dir: md.is_dir(), mtime }, tile.to_string()));
+            }
+        }
+        if !self.test {
+            for id in shell::desktop_icons() {
+                let name = format!("::{id}");
+                if let Some(tile) = rules::classify(&self.cfg, &name, false, false) {
+                    entries.push((Entry { path: PathBuf::from(&name), name, is_dir: false, mtime: SystemTime::UNIX_EPOCH }, tile.to_string()));
                 }
             }
         }
-        if wait {
-            unsafe { SetTimer(Some(self.main), T_RECHECK, 1000, None) };
+        // 规则或归属指向的磁贴还没有配置：补上
+        for (_, tile) in &entries {
+            if self.cfg.tiles.iter().all(|t| t.name != *tile) {
+                self.cfg.tiles.push(TileCfg { name: tile.clone(), rect: [0; 4], rolled: false, keep: false, locked: false, order: Vec::new() });
+            }
         }
-        self.sync_desk_icons();
+        self.entries = entries;
         self.sync_tiles();
     }
 
-    /// 磁贴里有指向此电脑、回收站等的快捷方式时，隐藏桌面上的原图标，像是挪进了磁贴；快捷方式都没了再显示回来
-    fn sync_desk_icons(&mut self) {
-        let mut linked: Vec<String> = std::fs::read_dir(&self.data)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
-            .filter(|e| rules::ext_of(&e.file_name().to_string_lossy()) == "lnk")
-            .filter_map(|e| shell::link_clsid(&e.path()))
-            .collect();
-        linked.sort();
-        linked.dedup();
-        if linked == self.cfg.desk {
-            return;
-        }
-        for id in linked.iter().filter(|id| !self.cfg.desk.contains(id)) {
-            shell::show_desktop_icon(id, false);
-        }
-        for id in self.cfg.desk.iter().filter(|id| !linked.contains(id)) {
-            shell::show_desktop_icon(id, true);
-        }
-        self.cfg.desk = linked;
-        self.save();
+    /// 文件在自己或公共的桌面目录里（换磁贴只改归属，不动文件）
+    pub fn on_desk(&self, f: &Path) -> bool {
+        f.parent().is_some_and(|p| same_path(p, &self.root) || self.public.as_deref().is_some_and(|q| same_path(p, q)))
     }
 
-    /// 按配置和磁贴目录的内容建窗口、刷新列表、决定显隐
+    /// 按配置和扫到的桌面项建窗口、刷新列表、决定显隐
     fn sync_tiles(&mut self) {
         let mut changed = false;
-        // 用户在 .Nookery 里手动建的文件夹也当成磁贴
-        for e in std::fs::read_dir(&self.data).into_iter().flatten().flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if e.metadata().is_ok_and(|m| m.is_dir() && !is_hidden(&m)) && self.tile_cfg(&name).is_none() {
-                self.cfg.tiles.push(TileCfg { name, rect: [0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
-                changed = true;
-            }
-        }
         for i in 0..self.cfg.tiles.len() {
             let name = self.cfg.tiles[i].name.clone();
             let list = self.listing(i);
@@ -425,13 +360,19 @@ impl App {
         }
     }
 
-    /// 第 i 块磁贴目录的内容：拖过的项按配置里的顺序在前，其余按 list_dir 的顺序跟在后面
-    fn listing(&self, i: usize) -> Vec<(String, bool, SystemTime)> {
+    /// 第 i 块磁贴的内容：拖过的项按配置里的顺序在前，其余文件夹在前、名字按资源管理器的自然顺序跟在后面
+    fn listing(&self, i: usize) -> Vec<Entry> {
         let c = &self.cfg.tiles[i];
-        let mut list = list_dir(&self.data.join(&c.name));
+        let mut list: Vec<Entry> = self.entries.iter().filter(|(_, t)| *t == c.name).map(|(e, _)| e.clone()).collect();
+        list.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                let (x, y) = (shell::wide(&a.name), shell::wide(&b.name));
+                unsafe { StrCmpLogicalW(PCWSTR(x.as_ptr()), PCWSTR(y.as_ptr())) }.cmp(&0)
+            })
+        });
         if !c.order.is_empty() {
             let pos: HashMap<&str, usize> = c.order.iter().enumerate().map(|(k, o)| (o.as_str(), k)).collect();
-            list.sort_by_key(|e| pos.get(e.0.as_str()).copied().unwrap_or(usize::MAX));
+            list.sort_by_key(|e| pos.get(e.name.as_str()).copied().unwrap_or(usize::MAX));
         }
         list
     }
@@ -500,38 +441,31 @@ impl App {
         self.save();
     }
 
-    /// target 为 Some(文件名) 时改文件名，None 时改磁贴名（连同目录和规则）
+    /// target 为 Some(文件名) 时改文件名，None 时改磁贴名（连同规则和归属）
     pub fn rename(&mut self, t: &mut Tile, target: Option<String>, new: &str) {
-        let dir = t.dir(self);
         match target {
             Some(old) if old != new => {
-                let (from, to) = (shell::wpath(&dir.join(&old)), shell::wpath(&dir.join(new)));
+                let Some(path) = t.items.iter().find(|it| it.name == old).map(|it| it.path.clone()) else { return };
+                let (from, to) = (shell::wpath(&path), shell::wpath(&path.with_file_name(new)));
                 match unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVE_FILE_FLAGS(0)) } {
                     Ok(()) => {
                         t.sel = vec![new.to_string()];
-                        // 排过序的项改名后留在原位
-                        if self.tile_cfg(&t.name).and_then(|c| c.order.iter_mut().find(|o| **o == old)).map(|o| *o = new.to_string()).is_some() {
-                            self.save();
+                        // 改了扩展名也留在这块磁贴；排过序的项改名后留在原位
+                        self.cfg.map.retain(|(n, _)| *n != old);
+                        self.cfg.set_map(new, &t.name);
+                        if let Some(o) = self.tile_cfg(&t.name).and_then(|c| c.order.iter_mut().find(|o| **o == old)) {
+                            *o = new.to_string();
                         }
+                        self.save();
                     }
                     Err(e) => self.warn(t, &format!("{}{}", tr("改名失败：", "Rename failed: "), e.message())),
                 }
             }
             None if t.name != new => {
-                let to = self.data.join(new);
-                // 没文件、正隐藏着的分类（目录不存在、没设常驻）不算重名：名字让给这块磁贴，分类的规则也归它
-                if to.exists() && !same_path(&to, &dir) || self.tile_cfg(new).is_some_and(|c| c.keep) {
+                // 没内容、正隐藏着的分类（没设常驻）不算重名：名字让给这块磁贴，分类的规则也归它
+                if self.tile_cfg(new).is_some_and(|c| c.keep) || self.entries.iter().any(|(_, x)| x == new) {
                     let msg = if lang::en() { format!("A tile named \"{new}\" already exists") } else { format!("已有名为“{new}”的磁贴") };
                     return self.warn(t, &msg);
-                }
-                let moved = if dir.exists() {
-                    let (f, n) = (shell::wpath(&dir), shell::wpath(&to));
-                    unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(n.as_ptr()), MOVE_FILE_FLAGS(0)) }.map_err(|e| e.message())
-                } else {
-                    std::fs::create_dir_all(&to).map_err(|e| e.to_string())
-                };
-                if let Err(e) = moved {
-                    return self.warn(t, &format!("{}{e}", tr("改名失败：", "Rename failed: ")));
                 }
                 self.cfg.tiles.retain(|c| c.name != new);
                 if let Some(k) = self.tiles.iter().position(|x| x.name == new) {
@@ -539,6 +473,7 @@ impl App {
                 }
                 let old = std::mem::replace(&mut t.name, new.to_string());
                 self.cfg.rename_tile(&old, new);
+                self.entries.iter_mut().filter(|(_, x)| *x == old).for_each(|(_, x)| *x = new.to_string());
                 let title = shell::wide(new);
                 unsafe {
                     let _ = SetWindowTextW(t.hwnd, PCWSTR(title.as_ptr()));
@@ -565,12 +500,11 @@ impl App {
         let base = tr("新磁贴", "New tile");
         let mut name = base.to_string();
         for n in 2.. {
-            if self.tile_cfg(&name).is_none() && !self.data.join(&name).exists() {
+            if self.tile_cfg(&name).is_none() {
                 break;
             }
             name = format!("{base} {n}");
         }
-        let _ = std::fs::create_dir_all(self.data.join(&name));
         self.cfg.tiles.push(TileCfg { name: name.clone(), rect: [0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
         let i = self.cfg.tiles.len() - 1;
         self.place(i, 0);
@@ -592,24 +526,24 @@ impl App {
         }
     }
 
-    /// 文件放回桌面根目录，之后按剩下的规则重新归类
+    /// 里面的项按剩下的规则分到别的磁贴
     pub fn delete_tile(&mut self, name: &str) {
         self.cfg.rules.retain(|(_, t)| t != name);
+        self.cfg.map.retain(|(_, t)| t != name);
         self.cfg.tiles.retain(|t| t.name != name);
-        let dir = self.data.join(name);
-        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            put_back(&e.path(), &self.root);
-        }
-        let _ = std::fs::remove_dir(&dir);
         if let Some(k) = self.tiles.iter().position(|t| t.name == name) {
             destroy(&self.tiles.remove(k));
         }
         self.save();
+        self.rescan();
     }
 
     /// 资源管理器重启后桌面窗口换了一个，磁贴（以旧桌面为所有者）会被系统连带销毁：全部重建
     fn rebuild_tiles(&mut self) {
         self.owner = unsafe { FindWindowW(w!("Progman"), PCWSTR::null()) }.ok();
+        if !self.test {
+            shell::show_icons(false);
+        }
         for t in self.tiles.drain(..) {
             destroy(&t);
         }
@@ -626,18 +560,24 @@ impl App {
         }
     }
 
-    pub fn drop_into(&mut self, t: &mut Tile, mut files: Vec<PathBuf>, copy: bool) {
-        let dir = t.dir(self);
-        files.retain(|f| !f.parent().is_some_and(|p| same_path(p, &dir)));
+    /// 桌面上的项只记归属；别处拖来的文件移动或复制到桌面目录，再记归属
+    pub fn drop_into(&mut self, t: &mut Tile, files: Vec<PathBuf>, copy: bool) {
         if files.is_empty() {
             return;
         }
-        let _ = std::fs::create_dir_all(&dir);
-        // 全是从别的磁贴拖来的同一种文件时，问要不要改规则
-        let from_tiles = files.iter().all(|f| !f.is_dir() && f.parent().and_then(Path::parent).is_some_and(|p| same_path(p, &self.data)));
+        // 全是桌面上（别的磁贴里）的同一种文件时，问要不要改规则
+        let from_tiles = files.iter().all(|f| !f.is_dir() && self.on_desk(f));
         let ext = rules::ext_of(&files[0].to_string_lossy());
         let one_ext = !ext.is_empty() && files.iter().all(|f| rules::ext_of(&f.to_string_lossy()) == ext);
-        shell::drop_files(t.hwnd, &files, &dir, copy);
+        let other: Vec<PathBuf> = files.iter().filter(|f| !self.on_desk(f)).cloned().collect();
+        if !other.is_empty() {
+            shell::drop_files(t.hwnd, &other, &self.root, copy);
+        }
+        for f in files.iter().filter_map(|f| f.file_name()) {
+            self.cfg.set_map(&f.to_string_lossy(), &t.name);
+        }
+        self.save();
+        self.rescan();
         if from_tiles && one_ext && self.cfg.tile_for(&ext) != Some(t.name.as_str()) {
             let msg = shell::wide(&if lang::en() {
                 format!("Always put .{ext} files in \"{}\"?", t.name)
@@ -651,12 +591,24 @@ impl App {
         }
     }
 
-    /// 卸载前用：所有文件放回桌面，并暂停自动归类
-    fn restore_all(&mut self) {
-        self.cfg.paused = true;
-        restore(&self.root);
+    /// 拖进来的系统项：此电脑、回收站这类桌面系统图标在“桌面图标设置”里打开、由磁贴显示；
+    /// 别的（控制面板里的某一项等）在桌面目录建快捷方式
+    pub fn link_into(&mut self, t: &Tile, links: &[windows::Win32::UI::Shell::IShellItem]) {
+        for it in links {
+            let name = match shell::desktop_clsid(it) {
+                Some(id) => {
+                    shell::show_desktop_icon(&id, true);
+                    format!("::{id}")
+                }
+                None => match shell::make_link(it, &self.root) {
+                    Some(n) => n,
+                    None => continue,
+                },
+            };
+            self.cfg.set_map(&name, &t.name);
+        }
         self.save();
-        self.sync_tiles();
+        self.rescan();
     }
 
     fn tray(&self, msg: NOTIFY_ICON_MESSAGE) {
@@ -694,16 +646,16 @@ impl App {
         }
     }
 
-    /// 默认磁贴名换成当前语言（目录、配置、窗口标题一起改）；用户改过名的、或新名字已被占用的不动。
+    /// 默认磁贴名换成当前语言（配置、窗口标题一起改）；用户改过名的、或新名字已被占用的不动。
     /// 托盘提示和桌面右键菜单的文字也跟着换
     fn relang(&mut self) {
         let en = lang::en();
         for (from, to) in self.cfg.lang_renames(en) {
-            let (src, dst) = (self.data.join(from), self.data.join(to));
-            if self.tile_cfg(to).is_some() || dst.exists() || src.exists() && std::fs::rename(&src, &dst).is_err() {
+            if self.tile_cfg(to).is_some() {
                 continue;
             }
             self.cfg.rename_tile(from, to);
+            self.entries.iter_mut().filter(|(_, x)| x == from).for_each(|(_, x)| *x = to.to_string());
             if let Some(t) = self.tiles.iter_mut().find(|t| t.name == from) {
                 t.name = to.into();
                 let title = shell::wide(to);
@@ -732,19 +684,13 @@ impl App {
             let _ = GetCursorPos(&mut pt);
         }
         let check = |on: bool, s: &'static str| if on { format!("✓{s}") } else { s.to_string() };
-        let (paused, auto, hidden) = (
-            check(self.cfg.paused, tr("暂停自动归类", "Pause auto-sorting")),
-            check(self.autostart(), tr("开机自启", "Start with Windows")),
-            check(self.hidden, tr("隐藏磁贴", "Hide tiles")),
-        );
+        let (auto, hidden) = (check(self.autostart(), tr("开机自启", "Start with Windows")), check(self.hidden, tr("隐藏磁贴", "Hide tiles")));
         let dbl = check(self.cfg.dblclick, tr("双击桌面空白处隐藏磁贴", "Double-click desktop to hide tiles"));
         let items = [
             (1, tr("新建磁贴", "New tile")),
             (6, hidden.as_str()),
             (7, dbl.as_str()),
-            (2, paused.as_str()),
             (0, ""),
-            (3, tr("全部还原到桌面", "Restore all to desktop")),
             (4, auto.as_str()),
             (0, ""),
             (5, tr("退出", "Exit")),
@@ -759,9 +705,9 @@ impl App {
         let menu = menu_from(&items);
         let (opacity, language) = (shell::wide(tr("磁贴透明度", "Tile opacity")), shell::wide(tr("语言/Language", "Language")));
         unsafe {
-            // 透明度子菜单插在“暂停自动归类”后面，语言子菜单插在“开机自启”后面
-            let _ = InsertMenuW(menu, 4, MF_BYPOSITION | MF_POPUP, menu_from(&sub).0 as usize, PCWSTR(opacity.as_ptr()));
-            let _ = InsertMenuW(menu, 8, MF_BYPOSITION | MF_POPUP, menu_from(&langs).0 as usize, PCWSTR(language.as_ptr()));
+            // 透明度子菜单插在“双击桌面空白处隐藏磁贴”后面，语言子菜单插在“开机自启”后面
+            let _ = InsertMenuW(menu, 3, MF_BYPOSITION | MF_POPUP, menu_from(&sub).0 as usize, PCWSTR(opacity.as_ptr()));
+            let _ = InsertMenuW(menu, 6, MF_BYPOSITION | MF_POPUP, menu_from(&langs).0 as usize, PCWSTR(language.as_ptr()));
         }
         match track(self.main, pt, menu) {
             id @ 200..=201 => {
@@ -774,21 +720,7 @@ impl App {
                 self.restyle();
             }
             1 => self.new_tile(None),
-            2 => {
-                self.cfg.paused = !self.cfg.paused;
-                self.save();
-                self.rescan();
-            }
-            3 => {
-                let ok = unsafe {
-                    let msg = shell::wide(tr("把所有磁贴里的文件放回桌面，并暂停自动归类？", "Move all files in tiles back to the desktop and pause auto-sorting?"));
-                    MessageBoxW(Some(self.main), PCWSTR(msg.as_ptr()), w!("Nookery"), MB_YESNO | MB_ICONQUESTION)
-                } == IDYES;
-                if ok {
-                    self.restore_all();
-                }
-            }
-            4 => self.set_autostart(!self.autostart()),
+            4 =>self.set_autostart(!self.autostart()),
             5 => unsafe {
                 self.tray(NIM_DELETE);
                 let _ = DestroyWindow(self.main);
@@ -833,7 +765,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             shell::WM_APP_FS => {
                 SetTimer(Some(hwnd), T_SCAN, 250, None);
             }
-            WM_TIMER if wp.0 == T_SCAN || wp.0 == T_RECHECK => {
+            WM_TIMER if wp.0 == T_SCAN => {
                 let _ = KillTimer(Some(hwnd), wp.0);
                 a.rescan();
             }
@@ -845,7 +777,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             WM_SETTINGCHANGE => a.restyle(),
             WM_APP_NEWTILE => a.new_tile(Some(POINT { x: lp.0 as i32, y: (lp.0 >> 32) as i32 })),
             WM_DISPLAYCHANGE => a.clamp_tiles(),
-            WM_DESTROY => PostQuitMessage(0),
+            WM_DESTROY => {
+                if !a.test {
+                    shell::show_icons(true);
+                }
+                PostQuitMessage(0);
+            }
             shell::WM_APP_DBLCLK => {
                 let pt = POINT { x: lp.0 as i32, y: (lp.0 >> 32) as i32 };
                 // wparam 为 1 是测试驱动发的，跳过“点在桌面空白处”的判断（examples/drive.rs 的 dblclk）
@@ -930,28 +867,70 @@ fn register_desktop_menu() {
     }
 }
 
-/// 磁贴里的一项放回桌面；系统图标的快捷方式不放回，删掉它、把桌面上的原图标显示回来
-fn put_back(path: &Path, root: &Path) {
-    match (rules::ext_of(&path.to_string_lossy()) == "lnk").then(|| shell::link_clsid(path)).flatten() {
-        Some(id) => {
-            shell::show_desktop_icon(&id, true);
-            let _ = std::fs::remove_file(path);
+/// 旧版把归进磁贴的文件移到 .Nookery\<磁贴名>\：搬回桌面，记下原来在哪块磁贴。
+/// 旧版指向此电脑、回收站等的快捷方式删掉，把原图标在“桌面图标设置”里打开，改由磁贴显示
+fn migrate(root: &Path, cfg: &mut Config) {
+    let mut old = false;
+    for d in std::fs::read_dir(root.join(DATA_DIR)).into_iter().flatten().flatten().filter(|d| d.path().is_dir()) {
+        old = true;
+        let tile = d.file_name().to_string_lossy().to_string();
+        for e in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+            let path = e.path();
+            let name = match (rules::ext_of(&path.to_string_lossy()) == "lnk").then(|| shell::link_clsid(&path)).flatten() {
+                Some(id) => {
+                    shell::show_desktop_icon(&id, true);
+                    let _ = std::fs::remove_file(&path);
+                    format!("::{id}")
+                }
+                None => match shell::move_unique(&path, root).and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())) {
+                    Some(n) => n,
+                    None => continue,
+                },
+            };
+            cfg.set_map(&name, &tile);
         }
-        None => {
-            shell::move_unique(path, root);
+        // 用户在 .Nookery 里手动建的磁贴目录
+        if cfg.tiles.iter().all(|t| t.name != tile) {
+            cfg.tiles.push(TileCfg { name: tile, rect: [0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
         }
+        let _ = std::fs::remove_dir(d.path());
+    }
+    // 测试模式里配置还在这个目录下，删不掉
+    let _ = std::fs::remove_dir(root.join(DATA_DIR));
+    if old {
+        cfg.add_shortcuts();
     }
 }
 
-/// .Nookery 下每个磁贴目录里的东西都放回桌面，并去掉桌面右键菜单
-fn restore(root: &Path) {
-    unsafe {
-        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, MENU_KEY);
-    }
-    for d in std::fs::read_dir(root.join(DATA_DIR)).into_iter().flatten().flatten() {
-        for e in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
-            put_back(&e.path(), root);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧版 .Nookery 里的文件搬回桌面（重名加序号），归属记到原磁贴；手建的磁贴目录留成常驻磁贴
+    #[test]
+    fn migrate_old_layout() {
+        let root = std::env::temp_dir().join("nookery-migrate-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join(DATA_DIR);
+        for d in ["文档", "手建"] {
+            std::fs::create_dir_all(data.join(d)).unwrap();
         }
+        for f in ["文档\\a.docx", "文档\\x.txt", "手建\\b.png"] {
+            std::fs::write(data.join(f), "x").unwrap();
+        }
+        std::fs::write(root.join("x.txt"), "x").unwrap();
+        let mut cfg = Config::parse("");
+        cfg.rules.retain(|(k, _)| k != "lnk");
+        migrate(&root, &mut cfg);
+        let mut names: Vec<String> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        names.sort();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(names, ["a.docx", "b.png", "x (2).txt", "x.txt"]);
+        for (n, t) in [("a.docx", "文档"), ("x (2).txt", "文档"), ("b.png", "手建")] {
+            assert_eq!(rules::classify(&cfg, n, false, false), Some(t));
+        }
+        assert!(cfg.tiles.iter().any(|t| t.name == "手建" && t.keep));
+        assert_eq!(rules::classify(&cfg, "微信.lnk", false, false), Some("快捷方式"));
     }
 }
 
@@ -974,20 +953,15 @@ fn main() {
     let root = test_root.clone().unwrap_or_else(shell::desktop_dir);
     lang::load();
     if args.iter().any(|a| a == "--uninstall") {
-        // 卸载程序调用（调用前已结束正在运行的实例）：文件放回桌面，删开机自启和右键菜单，空的磁贴目录一并删掉。
-        // 读快捷方式（认出系统图标）要先初始化 COM
+        // 卸载程序调用（调用前已强制结束正在运行的实例，桌面图标还关着）：显示回桌面图标，删开机自启和右键菜单；
+        // 顺带把旧版留下的文件搬回桌面（读快捷方式认出系统图标要先初始化 COM）
         unsafe {
             let _ = OleInitialize(None);
-        }
-        restore(&root);
-        unsafe {
+            migrate(&root, &mut Config::parse(""));
+            shell::show_icons(true);
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, MENU_KEY);
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Nookery"));
         }
-        let data = root.join(DATA_DIR);
-        for d in std::fs::read_dir(&data).into_iter().flatten().flatten() {
-            let _ = std::fs::remove_dir(d.path());
-        }
-        let _ = std::fs::remove_dir(&data);
         return;
     }
     unsafe {
@@ -1007,15 +981,18 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = OleInitialize(None);
 
-        let data = root.join(DATA_DIR);
-        let _ = std::fs::create_dir_all(&data);
-        let d = shell::wpath(&data);
-        let _ = SetFileAttributesW(PCWSTR(d.as_ptr()), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
         let cfg_path = match &test_root {
-            Some(_) => data.join("config.txt"),
+            Some(_) => {
+                let data = root.join(DATA_DIR);
+                let _ = std::fs::create_dir_all(&data);
+                let d = shell::wpath(&data);
+                let _ = SetFileAttributesW(PCWSTR(d.as_ptr()), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+                data.join("config.txt")
+            }
             None => PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("Nookery").join("config.txt"),
         };
-        let cfg = Config::parse(&std::fs::read_to_string(&cfg_path).unwrap_or_default());
+        let mut cfg = Config::parse(&std::fs::read_to_string(&cfg_path).unwrap_or_default());
+        migrate(&root, &mut cfg);
 
         let d2d: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).expect("D2D 初始化失败");
         let gfx = gfx::Gfx::new(&d2d).expect("D3D 初始化失败");
@@ -1046,7 +1023,8 @@ fn main() {
 
         let mut a = Box::new(App {
             root: root.clone(),
-            data,
+            public: if test_root.is_some() { None } else { shell::public_desktop_dir() },
+            entries: Vec::new(),
             cfg_path,
             cfg,
             main,
@@ -1098,27 +1076,8 @@ fn main() {
         a.load_theme();
         APP = &mut *a;
         a.tray(NIM_ADD);
-        // 第一次在真实桌面上运行：先说清楚要动多少项，确认后再整理
-        if test_root.is_none() && !a.cfg_path.exists() {
-            let n = std::fs::read_dir(&a.root)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|e| e.file_name() != DATA_DIR && e.metadata().is_ok_and(|m| rules::classify(&a.cfg, &e.file_name().to_string_lossy(), m.is_dir(), is_hidden(&m)).is_some()))
-                .count();
-            let msg = shell::wide(&if lang::en() {
-                format!(
-                    "Nookery will sort {n} loose files and folders on your desktop into tiles by type. Shortcuts stay put.\nYou can always choose \"Restore all to desktop\" in the tray menu.\n\nSort now? Choose \"No\" to pause auto-sorting for now."
-                )
-            } else {
-                format!(
-                    "Nookery 会把桌面上 {n} 个散文件和文件夹按类型收进磁贴，快捷方式不动。\n随时可以在托盘菜单里“全部还原到桌面”。\n\n现在整理吗？选“否”会先暂停自动归类。"
-                )
-            });
-            if n > 0 && MessageBoxW(Some(main), PCWSTR(msg.as_ptr()), w!("Nookery"), MB_YESNO | MB_ICONQUESTION) != IDYES {
-                a.cfg.paused = true;
-            }
-            a.save();
+        if test_root.is_none() {
+            shell::show_icons(false);
         }
         if a.cfg.dblclick {
             a.set_dblclick(true);
@@ -1127,6 +1086,12 @@ fn main() {
         a.relang();
         shell::watch(root, main);
         a.rescan();
+        // 归属记录只在启动时清理：运行中文件可能被程序“删了再写”，一时不在
+        let n = a.cfg.map.len();
+        a.cfg.map.retain(|(name, _)| a.entries.iter().any(|(e, _)| e.name == *name));
+        if a.cfg.map.len() != n {
+            a.save();
+        }
         if new_tile {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
