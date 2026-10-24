@@ -145,7 +145,8 @@ fn title_layout(w: f32) -> (D2D_RECT_F, D2D_RECT_F, (f32, f32)) {
 }
 
 impl Tile {
-    pub fn create(a: &App, name: &str, r: [i32; 4], rolled: bool, locked: bool) -> Box<Tile> {
+    /// 位置和大小由 App::layout 按配置摆
+    pub fn create(a: &App, name: &str, rolled: bool, locked: bool) -> Box<Tile> {
         let mut t = Box::new(Tile {
             name: name.into(),
             hwnd: HWND::default(),
@@ -178,10 +179,10 @@ impl Tile {
                 crate::TILE_CLASS,
                 PCWSTR(title.as_ptr()),
                 WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN,
-                r[0],
-                r[1],
-                r[2],
-                r[3],
+                0,
+                0,
+                0,
+                0,
                 a.owner,
                 None,
                 None,
@@ -190,9 +191,6 @@ impl Tile {
             .expect("创建磁贴窗口失败");
             SetWindowLongPtrW(t.hwnd, GWLP_USERDATA, &mut *t as *mut Tile as isize);
             crate::drop::register(&mut t);
-            if rolled {
-                let _ = SetWindowPos(t.hwnd, None, 0, 0, r[2], (TITLE_H * scale(t.hwnd)) as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            }
             t.apply_style(a);
         }
         t
@@ -992,10 +990,15 @@ pub unsafe extern "system" fn tile_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 t.invalidate();
             }
             WM_DPICHANGED => {
-                let r = &*(lp.0 as *const RECT);
-                let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                // 按着左键是用户正把磁贴拖到 / 拉到另一块显示器上：用系统建议的矩形保持看上去一样大，松手时存盘；
+                // 否则是改了缩放比例，或程序自己把磁贴挪到了别的显示器：按配置里的比例重新摆
+                if key_down(VK_LBUTTON) {
+                    let r = &*(lp.0 as *const RECT);
+                    let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                } else {
+                    a.layout();
+                }
                 t.drop_device();
-                a.save_rect(t);
             }
             WM_NCHITTEST => return t.nc_hit(lp),
             WM_GETMINMAXINFO => {

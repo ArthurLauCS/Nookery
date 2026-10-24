@@ -153,6 +153,40 @@ pub fn fit_work_area(r: &RECT) -> (i32, i32) {
     (r.left.clamp(wa.left, (wa.right - w).max(wa.left)), r.top.clamp(wa.top, (wa.bottom - h).max(wa.top)))
 }
 
+fn xywh(r: &RECT) -> [i32; 4] {
+    [r.left, r.top, r.right - r.left, r.bottom - r.top]
+}
+
+/// 显示器的设备名（如 \\.\DISPLAY1）和工作区
+fn mon_info(h: HMONITOR) -> (String, RECT) {
+    let mut mi = MONITORINFOEXW { monitorInfo: MONITORINFO { cbSize: size_of::<MONITORINFOEXW>() as u32, ..Default::default() }, ..Default::default() };
+    unsafe {
+        let _ = GetMonitorInfoW(h, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO);
+    }
+    (String::from_utf16_lossy(&mi.szDevice).trim_end_matches('\0').into(), mi.monitorInfo.rcWork)
+}
+
+/// 磁贴配置里的比例换算成像素矩形；它那块显示器不在了（比如拔掉了副屏）就按主屏算，插回来自动回原位
+fn tile_px(c: &TileCfg) -> [i32; 4] {
+    unsafe extern "system" fn add(h: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
+        unsafe { (*(lp.0 as *mut Vec<HMONITOR>)).push(h) };
+        TRUE
+    }
+    let mut all = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(add), LPARAM(&mut all as *mut _ as isize));
+    }
+    let wa = all.into_iter().map(mon_info).find(|(n, _)| *n == c.mon).map_or_else(|| mon_info(unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) }).1, |(_, wa)| wa);
+    rules::to_px(c.rect, xywh(&wa))
+}
+
+/// 像素矩形所在（离它最近）的显示器，和它在那块显示器工作区里的比例
+fn locate(r: [i32; 4]) -> (String, [f32; 4]) {
+    let rc = RECT { left: r[0], top: r[1], right: r[0] + r[2], bottom: r[1] + r[3] };
+    let (mon, wa) = mon_info(unsafe { MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST) });
+    (mon, rules::to_frac(r, xywh(&wa)))
+}
+
 fn is_hidden(md: &std::fs::Metadata) -> bool {
     md.file_attributes() & (FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0) != 0
 }
@@ -311,7 +345,7 @@ impl App {
         // 规则或归属指向的磁贴还没有配置：补上
         for (_, tile) in &entries {
             if self.cfg.tiles.iter().all(|t| t.name != *tile) {
-                self.cfg.tiles.push(TileCfg { name: tile.clone(), rect: [0; 4], rolled: false, keep: false, locked: false, order: Vec::new() });
+                self.cfg.tiles.push(TileCfg { name: tile.clone(), mon: String::new(), rect: [0.0; 4], rolled: false, keep: false, locked: false, order: Vec::new() });
             }
         }
         self.entries = entries;
@@ -325,7 +359,7 @@ impl App {
 
     /// 按配置和扫到的桌面项建窗口、刷新列表、决定显隐
     fn sync_tiles(&mut self) {
-        let mut changed = false;
+        let (mut changed, mut shown) = (false, false);
         for i in 0..self.cfg.tiles.len() {
             let name = self.cfg.tiles[i].name.clone();
             let list = self.listing(i);
@@ -334,12 +368,12 @@ impl App {
                 Some(k) => k,
                 None if !visible => continue,
                 None => {
-                    if self.cfg.tiles[i].rect[2] == 0 {
+                    if self.cfg.tiles[i].rect[2] == 0.0 {
                         self.place(i, list.len());
                         changed = true;
                     }
                     let c = &self.cfg.tiles[i];
-                    let t = Tile::create(self, &name, c.rect, c.rolled, c.locked);
+                    let t = Tile::create(self, &name, c.rolled, c.locked);
                     self.tiles.push(t);
                     self.tiles.len() - 1
                 }
@@ -352,8 +386,13 @@ impl App {
                 t.set_items(list);
             }
             unsafe {
+                shown |= IsWindowVisible(t.hwnd).as_bool() != visible;
                 let _ = ShowWindow(t.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
             }
+        }
+        // 新建了磁贴，或有磁贴显示 / 隐藏了：位置要摆，折叠标题栏压住谁也跟着变
+        if shown {
+            self.layout();
         }
         if changed {
             self.save();
@@ -397,24 +436,30 @@ impl App {
         let rows = n.div_ceil(3).clamp(1, 3) as f32;
         let (w, g) = ((340.0 * s) as i32, (12.0 * s) as i32);
         let h = ((TITLE_H + 2.0 * PAD + rows * CELL_H) * s) as i32;
+        let placed: Vec<[i32; 4]> = self.cfg.tiles.iter().filter(|t| t.rect[2] > 0.0).map(tile_px).collect();
         for c in 0..20 {
             let x = wa.right - (c + 1) * (w + g);
-            let bottom = self.cfg.tiles.iter().filter(|t| t.rect[2] > 0 && t.rect[0] < x + w && x < t.rect[0] + t.rect[2]).map(|t| t.rect[1] + t.rect[3]).max();
+            let bottom = placed.iter().filter(|r| r[0] < x + w && x < r[0] + r[2]).map(|r| r[1] + r[3]).max();
             let y = bottom.unwrap_or(wa.top) + g;
             if y + h <= wa.bottom || c == 19 {
-                self.cfg.tiles[i].rect = [x, y, w, h];
+                (self.cfg.tiles[i].mon, self.cfg.tiles[i].rect) = locate([x, y, w, h]);
                 return;
             }
         }
     }
+
+    /// 用户拖动或改了尺寸：按磁贴现在所在的显示器记下比例
     pub fn save_rect(&mut self, t: &Tile) {
         let mut r = RECT::default();
         unsafe {
             let _ = GetWindowRect(t.hwnd, &mut r);
         }
+        let (mon, f) = locate(xywh(&r));
         let rolled = t.rolled;
         if let Some(c) = self.tile_cfg(&t.name) {
-            c.rect = [r.left, r.top, r.right - r.left, if rolled { c.rect[3] } else { r.bottom - r.top }];
+            // 折叠时窗口只剩标题栏，展开的高度沿用配置里的
+            c.rect = [f[0], f[1], f[2], if rolled { f[1] + c.rect[3] - c.rect[1] } else { f[3] }];
+            c.mon = mon;
         }
         self.save();
     }
@@ -423,12 +468,7 @@ impl App {
         t.rolled = !t.rolled;
         let Some(c) = self.tile_cfg(&t.name) else { return };
         c.rolled = t.rolled;
-        let s = unsafe { GetDpiForWindow(t.hwnd) } as f32 / 96.0;
-        let h = if t.rolled { (TITLE_H * s) as i32 } else { c.rect[3] };
-        let w = c.rect[2];
-        unsafe {
-            let _ = SetWindowPos(t.hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        self.layout();
         self.save();
     }
 
@@ -505,18 +545,18 @@ impl App {
             }
             name = format!("{base} {n}");
         }
-        self.cfg.tiles.push(TileCfg { name: name.clone(), rect: [0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
+        self.cfg.tiles.push(TileCfg { name: name.clone(), mon: String::new(), rect: [0.0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
         let i = self.cfg.tiles.len() - 1;
         self.place(i, 0);
         if let Some(pt) = at {
             // 左上角放在右键的位置，超出工作区就往回挪
-            let [_, _, w, h] = self.cfg.tiles[i].rect;
+            let [_, _, w, h] = tile_px(&self.cfg.tiles[i]);
             let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
             unsafe {
                 let _ = GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi);
             }
             let wa = mi.rcWork;
-            self.cfg.tiles[i].rect = [pt.x.min(wa.right - w).max(wa.left), pt.y.min(wa.bottom - h).max(wa.top), w, h];
+            (self.cfg.tiles[i].mon, self.cfg.tiles[i].rect) = locate([pt.x.min(wa.right - w).max(wa.left), pt.y.min(wa.bottom - h).max(wa.top), w, h]);
         }
         self.save();
         self.sync_tiles();
@@ -735,21 +775,35 @@ impl App {
         }
     }
 
-    /// 分辨率或显示器变化后，把跑到屏幕外的磁贴拉回最近的工作区
-    fn clamp_tiles(&mut self) {
-        for t in &self.tiles {
-            let mut r = RECT::default();
-            unsafe {
-                let _ = GetWindowRect(t.hwnd, &mut r);
-                let (x, y) = fit_work_area(&r);
-                if (x, y) != (r.left, r.top) {
-                    let _ = SetWindowPos(t.hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    /// 所有磁贴按配置里的比例摆到各自显示器的工作区上。完全按比例、不套最小尺寸，屏幕变小时磁贴不互相压住，
+    /// 装不下的内容在磁贴里滚动。折叠的磁贴只剩标题栏，标题栏高度不随分辨率缩小：从上往下摆，被上方折叠标题栏压住的
+    /// 磁贴上边让到标题栏下方（隔吸附间距），展开的下边不动、变矮，折叠的整条往下挪、接着让它下面的。
+    /// 不存盘，换回原来的分辨率时原样复原
+    pub fn layout(&self) {
+        let mut v: Vec<(&Tile, [i32; 4])> = self.tiles.iter().filter_map(|t| Some((&**t, tile_px(self.cfg.tiles.iter().find(|c| c.name == t.name)?)))).collect();
+        v.sort_by_key(|(_, r)| r[1]);
+        for i in 0..v.len() {
+            let (t, mut r) = v[i];
+            let s = unsafe { GetDpiForWindow(t.hwnd) } as f32 / 96.0;
+            let bar = (TITLE_H * s) as i32;
+            let under = v[..i]
+                .iter()
+                .filter(|(u, o)| u.rolled && unsafe { IsWindowVisible(u.hwnd) }.as_bool() && o[0] < r[0] + r[2] && r[0] < o[0] + o[2] && o[1] + o[3] > r[1])
+                .map(|(_, o)| o[1] + o[3] + (8.0 * s) as i32)
+                .max();
+            if let Some(y) = under {
+                if !t.rolled {
+                    r[3] = (r[3] - (y - r[1])).max(bar);
                 }
+                r[1] = y;
             }
-        }
-        let tiles: Vec<*const Tile> = self.tiles.iter().map(|t| &**t as *const Tile).collect();
-        for t in tiles {
-            self.save_rect(unsafe { &*t });
+            if t.rolled {
+                r[3] = bar;
+            }
+            v[i].1 = r;
+            unsafe {
+                let _ = SetWindowPos(t.hwnd, None, r[0], r[1], r[2], r[3], SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
     }
 }
@@ -774,9 +828,15 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 WM_RBUTTONUP => a.tray_menu(),
                 _ => {}
             },
-            WM_SETTINGCHANGE => a.restyle(),
+            WM_SETTINGCHANGE => {
+                // 任务栏挪了位置、改了大小，或分辨率变了之后任务栏重新摆好，工作区跟着变
+                if wp.0 == SPI_SETWORKAREA.0 as usize {
+                    a.layout();
+                }
+                a.restyle();
+            }
             WM_APP_NEWTILE => a.new_tile(Some(POINT { x: lp.0 as i32, y: (lp.0 >> 32) as i32 })),
-            WM_DISPLAYCHANGE => a.clamp_tiles(),
+            WM_DISPLAYCHANGE => a.layout(),
             WM_DESTROY => {
                 if !a.test {
                     shell::show_icons(true);
@@ -868,7 +928,8 @@ fn register_desktop_menu() {
 }
 
 /// 旧版把归进磁贴的文件移到 .Nookery\<磁贴名>\：搬回桌面，记下原来在哪块磁贴。
-/// 旧版指向此电脑、回收站等的快捷方式删掉，把原图标在“桌面图标设置”里打开，改由磁贴显示
+/// 旧版指向此电脑、回收站等的快捷方式删掉，把原图标在“桌面图标设置”里打开，改由磁贴显示。
+/// 旧版配置里磁贴位置是像素坐标：按当时所在的显示器换算成比例
 fn migrate(root: &Path, cfg: &mut Config) {
     let mut old = false;
     for d in std::fs::read_dir(root.join(DATA_DIR)).into_iter().flatten().flatten().filter(|d| d.path().is_dir()) {
@@ -891,7 +952,7 @@ fn migrate(root: &Path, cfg: &mut Config) {
         }
         // 用户在 .Nookery 里手动建的磁贴目录
         if cfg.tiles.iter().all(|t| t.name != tile) {
-            cfg.tiles.push(TileCfg { name: tile, rect: [0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
+            cfg.tiles.push(TileCfg { name: tile, mon: String::new(), rect: [0.0; 4], rolled: false, keep: true, locked: false, order: Vec::new() });
         }
         let _ = std::fs::remove_dir(d.path());
     }
@@ -899,6 +960,9 @@ fn migrate(root: &Path, cfg: &mut Config) {
     let _ = std::fs::remove_dir(root.join(DATA_DIR));
     if old {
         cfg.add_shortcuts();
+    }
+    for c in cfg.tiles.iter_mut().filter(|c| c.mon.is_empty() && c.rect[2] > 0.0) {
+        (c.mon, c.rect) = locate(c.rect.map(|v| v as i32));
     }
 }
 
