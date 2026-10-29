@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 Desktop tiles for Windows 11. Everything on your desktop (shortcuts, folders, documents, pictures, ...) is shown in tiles by type. Files never move: open the Desktop folder in File Explorer and everything is still there.
 
-- A single ~440 KB exe, 12–14 MB private memory, 0% CPU when idle.
+- A single ~410 KB exe (the setup is ~7.6 MB with the bundled tile-name font), about 9 MB private memory with three tiles, 0% CPU when idle.
 - Tiles keep their place and proportions when you change the resolution, display scaling or taskbar; switch back and the layout is exactly as before.
 - Five tile opacity levels, down to fully transparent with only a faint border; follows the system light/dark theme.
 - Files show the same system icons you see in File Explorer.
@@ -67,7 +67,8 @@ Pick it under **Tile opacity** in the tray menu; it applies to all tiles.
 
 | Level | Look |
 |---|---|
-| 100% / 75% / 50% | Acrylic blur, thinner at lower levels |
+| 100% | Solid paper-colored background (warm off-white, or warm charcoal in dark) |
+| 75% / 50% | Acrylic blur under the tinted background, thinner at lower levels |
 | 25% | Translucent, no blur |
 | 0% | Fully transparent with a faint border (white outside, black inside, visible on any wallpaper); the background fades in on hover |
 
@@ -113,13 +114,15 @@ cargo build --release
 
 Output: `target/release/nookery.exe`. Requires the Rust toolchain and MSVC build tools.
 
+Tile names use the bundled Zhuque Fangsong font (SIL OFL 1.1, see `THIRD_PARTY_NOTICES.txt`). It is not in git: run `powershell -File scripts/fonts.ps1` once to download it (pinned URL and SHA-256) into `assets/fonts`, where a dev build finds it. Installed builds read the `fonts` folder next to `nookery.exe`. Without the file, tile names fall back to Microsoft YaHei UI; file names and menus always use Microsoft YaHei UI.
+
 Installer (requires [Inno Setup 6](https://jrsoftware.org/isdl.php) and the Windows SDK):
 
 ```bash
 powershell -File scripts/installer.ps1
 ```
 
-Builds release (including the context menu extension in `menu/`), packs `installer/AppxManifest.xml` into a signed sparse package, then builds `target/installer/Nookery-Setup-<version>.exe` using the version in `Cargo.toml`. Signing uses the self-signed `CN=Nookery` certificate in the current user's store, created automatically if missing. The setup script is `installer/nookery.iss`; the Simplified Chinese messages `installer/ChineseSimplified.isl` come from the unofficial translations in the Inno Setup repository.
+Runs `scripts/fonts.ps1`, builds release (including the context menu extension in `menu/`), packs `installer/AppxManifest.xml` into a signed sparse package, then builds `target/installer/Nookery-Setup-<version>.exe` using the version in `Cargo.toml`. Signing uses the self-signed `CN=Nookery` certificate in the current user's store, created automatically if missing. The setup script is `installer/nookery.iss`; the Simplified Chinese messages `installer/ChineseSimplified.isl` come from the unofficial translations in the Inno Setup repository.
 
 The app icon sources are `assets/icon.svg` (40 px and up) and `assets/icon-small.svg` (16–32 px). Run `python scripts/icon.py` to regenerate `assets/app.ico` and `assets/app.res` (requires Chrome, Pillow and the Windows SDK); `build.rs` links them into the exe.
 

@@ -4,7 +4,7 @@
 
 Windows 11 桌面磁贴。桌面上的东西（快捷方式、文件夹、文档、图片等）按类型显示在对应的磁贴里。文件不挪位置，在资源管理器里打开“桌面”文件夹，所有东西都还在。
 
-- 单个约 440 KB 的 exe，常驻私有内存 12~14 MB，空闲时 CPU 为 0。
+- 单个约 410 KB 的 exe（安装包连磁贴名字体约 7.6 MB），三个磁贴时常驻私有内存约 9 MB，空闲时 CPU 为 0。
 - 换分辨率、缩放比例或任务栏时，磁贴的位置和大小按屏幕比例自适应；换回去和原来分毫不差。
 - 磁贴透明度五档可调，最高全透明只留一圈淡边框；跟随系统深浅色。
 - 文件图标用系统原版图标，和资源管理器里看到的一样。
@@ -27,13 +27,15 @@ cargo build --release
 
 产物在 `target/release/nookery.exe`，需要 Rust 工具链和 MSVC 生成工具。
 
+磁贴名用随程序带的朱雀仿宋（SIL OFL 1.1，见 `THIRD_PARTY_NOTICES.txt`），字体文件不进 git：先跑一次 `powershell -File scripts/fonts.ps1`，按固定的网址和 SHA-256 下载到 `assets/fonts`，开发版从那里读；安装版读 `nookery.exe` 旁的 `fonts` 文件夹。缺了字体文件，磁贴名退回微软雅黑 UI；文件名和菜单一直用微软雅黑 UI。
+
 安装包（需要 [Inno Setup 6](https://jrsoftware.org/isdl.php) 和 Windows SDK）：
 
 ```bash
 powershell -File scripts/installer.ps1
 ```
 
-先编译 release（含右键菜单扩展 `menu/`），把 `installer/AppxManifest.xml` 打成稀疏包并签名，再按 `Cargo.toml` 的版本号打包到 `target/installer/Nookery-Setup-<版本>.exe`。签名用当前用户证书库里的自签证书 `CN=Nookery`，没有会自动新建。
+先运行 `scripts/fonts.ps1`，再编译 release（含右键菜单扩展 `menu/`），把 `installer/AppxManifest.xml` 打成稀疏包并签名，再按 `Cargo.toml` 的版本号打包到 `target/installer/Nookery-Setup-<版本>.exe`。签名用当前用户证书库里的自签证书 `CN=Nookery`，没有会自动新建。
 
 安装包：
 
@@ -95,7 +97,8 @@ powershell -File scripts/installer.ps1
 
 | 档位 | 效果 |
 |---|---|
-| 100% / 75% / 50% | 亚克力磨砂，档位越低底色越薄 |
+| 100% | 不透明的纸色底（浅色是暖白，深色是暖炭灰） |
+| 75% / 50% | 亚克力磨砂，档位越低底色越薄 |
 | 25% | 半透明底色，背后不模糊 |
 | 0% | 全透明，只留一圈淡边框（外白内黑，深浅壁纸上都看得出）；鼠标移到磁贴上时淡淡显出底色 |
 
