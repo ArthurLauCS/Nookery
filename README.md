@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 Desktop tiles for Windows 11. Everything on your desktop (shortcuts, folders, documents, pictures, ...) is shown in tiles by type. Files never move: open the Desktop folder in File Explorer and everything is still there.
 
-- A single ~410 KB exe (the setup is ~7.6 MB with the bundled tile-name font), about 9 MB private memory with three tiles, 0% CPU when idle.
+- A single ~475 KB exe (the setup is ~7.6 MB with the bundled tile-name font), about 9 MB private memory with three tiles, 0% CPU when idle.
 - Tiles keep their place and proportions when you change the resolution, display scaling or taskbar; switch back and the layout is exactly as before.
 - Five tile opacity levels, down to fully transparent with only a faint border; follows the system light/dark theme.
 - Files show the same system icons you see in File Explorer.
