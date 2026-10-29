@@ -1,4 +1,4 @@
-//! 桌面上的短暂提示：胶囊形浮层，停留 1.4 秒后用 8 帧淡出，之后隐藏复用。只在淡出期间重绘。
+//! 桌面上的短暂提示：小浮层，停留 1.4 秒后用 8 帧淡出，之后隐藏复用。只在淡出期间重绘。
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -11,13 +11,14 @@ use windows::core::*;
 use windows_numerics::Vector2;
 
 use crate::gfx::Surface;
+use crate::theme::{HAIR, RADIUS_PANEL};
 use crate::{App, app};
 
 pub const TOAST_CLASS: PCWSTR = w!("NookeryToast");
 const T_HOLD: usize = 1;
 const T_FADE: usize = 2;
-const H: f32 = 40.0;
-const PAD_X: f32 = 20.0;
+const H: f32 = 36.0;
+const PAD_X: f32 = 16.0;
 
 pub struct Toast {
     hwnd: HWND,
@@ -91,14 +92,15 @@ fn draw(a: &App, t: &mut Toast) {
         let (w, h) = (r.right as f32 * 96.0 / dpi, r.bottom as f32 * 96.0 / dpi);
         rt.BeginDraw();
         rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
-        // 深色胶囊在任何壁纸上都看得清，不随主题变
-        br.SetColor(&D2D1_COLOR_F { r: 0.125, g: 0.125, b: 0.125, a: 0.92 * t.alpha });
-        let pill = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: 0.0, top: 0.0, right: w, bottom: h }, radiusX: h / 2.0, radiusY: h / 2.0 };
-        rt.FillRoundedRectangle(&pill, br);
-        br.SetColor(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.16 * t.alpha });
-        let edge = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: 0.5, top: 0.5, right: w - 0.5, bottom: h - 0.5 }, radiusX: h / 2.0, radiusY: h / 2.0 };
-        rt.DrawRoundedRectangle(&edge, br, 1.0, None);
-        br.SetColor(&D2D1_COLOR_F { r: 0.953, g: 0.953, b: 0.953, a: t.alpha });
+        // 浮层：bg 底、1 px border、圆角 8，随磁贴的深浅色
+        let th = &a.theme;
+        let fade = |c: &D2D1_COLOR_F| D2D1_COLOR_F { a: c.a * t.alpha, ..*c };
+        let pop = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: 0.5, top: 0.5, right: w - 0.5, bottom: h - 0.5 }, radiusX: RADIUS_PANEL, radiusY: RADIUS_PANEL };
+        br.SetColor(&fade(&th.pop_bg));
+        rt.FillRoundedRectangle(&pop, br);
+        br.SetColor(&fade(&th.pop_line));
+        rt.DrawRoundedRectangle(&pop, br, HAIR, None);
+        br.SetColor(&fade(&th.pop_text));
         rt.DrawTextLayout(Vector2 { X: 0.0, Y: 0.0 }, &layout, br, D2D1_DRAW_TEXT_OPTIONS_NONE);
         let _ = rt.EndDraw(None, None);
         let _ = a.gfx.present(&surf);

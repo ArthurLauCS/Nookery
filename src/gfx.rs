@@ -22,6 +22,8 @@ pub struct Gfx {
     dcomp: IDCompositionDevice,
     pub dc: ID2D1DeviceContext,
     pub brush: ID2D1SolidColorBrush,
+    /// 线图标用：圆头圆角
+    pub stroke: ID2D1StrokeStyle,
 }
 
 #[derive(Clone)]
@@ -41,7 +43,15 @@ impl Gfx {
             let dxgi_dev: IDXGIDevice = d3d.cast()?;
             let dc = factory.CreateDevice(&dxgi_dev)?.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             let brush = dc.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, None)?;
-            Ok(Gfx { dxgi: CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?, dcomp: DCompositionCreateDevice(&dxgi_dev)?, d3d, dc, brush })
+            let props = D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                dashCap: D2D1_CAP_STYLE_ROUND,
+                lineJoin: D2D1_LINE_JOIN_ROUND,
+                ..Default::default()
+            };
+            let stroke = factory.cast::<ID2D1Factory>()?.CreateStrokeStyle(&props, None)?;
+            Ok(Gfx { stroke, dxgi: CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?, dcomp: DCompositionCreateDevice(&dxgi_dev)?, d3d, dc, brush })
         }
     }
 

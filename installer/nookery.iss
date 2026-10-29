@@ -47,6 +47,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 [Files]
 Source: "..\target\release\nookery.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\nookery_menu.dll"; DestDir: "{app}"; Flags: ignoreversion
+; 磁贴名字体（scripts\fonts.ps1 下载到 assets\fonts）；缺了程序也能运行，退回雅黑 UI
+Source: "..\assets\fonts\*"; DestDir: "{app}\fonts"; Flags: ignoreversion
+Source: "..\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\installer\nookery.msix"; DestDir: "{tmp}"
 Source: "..\target\installer\nookery.cer"; DestDir: "{tmp}"
 
