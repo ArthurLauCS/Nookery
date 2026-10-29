@@ -20,29 +20,79 @@ use windows_numerics::Vector2;
 use crate::gfx::Surface;
 use crate::lang::tr;
 use crate::shell::{self, Items, Picked};
+use crate::theme::{HAIR, RADIUS_CONTROL, RADIUS_PANEL};
 use crate::{App, app, fit_work_area, popup};
 
 // 间距都在 4 / 8 的格子上；字号只有两档（12 / 14，1.2 比例），在 main.rs 的字体里
 pub const TITLE_H: f32 = 36.0;
 pub const PAD: f32 = 8.0;
 const CELL_W: f32 = 84.0;
-pub const CELL_H: f32 = 96.0;
+/// 格子里图标上方和两行文件名下方留一样的空：选中框里上下对称；
+/// 磁贴高度刚好放下几行时，最后一行下面的空也和标题栏到第一行图标的一样（都是 PAD + CELL_PAD）
+const CELL_PAD: f32 = 4.0;
+pub const CELL_H: f32 = CELL_PAD + ICON + GAP + LABEL_H + CELL_PAD;
 /// 和桌面默认的“中等图标”一样大：图标文件里一般就有这一档，不用缩放
 const ICON: f32 = 48.0;
 /// 图标下沿到文件名的距离
 const GAP: f32 = 8.0;
 const LABEL_H: f32 = 32.0;
-const RADIUS: f32 = 6.0;
+const RADIUS: f32 = RADIUS_CONTROL;
 const EDGE: f32 = 6.0;
 const MIN_W: f32 = 120.0;
 /// 标题栏右上角的折叠、锁定按钮
 const BTN: f32 = 28.0;
 const BTN_PAD: f32 = 4.0;
-// Segoe Fluent Icons / Segoe MDL2 Assets 里的系统图标
-const GLYPH_COLLAPSE: &str = "\u{E70E}";
-const GLYPH_EXPAND: &str = "\u{E70D}";
-const GLYPH_LOCK: &str = "\u{E72E}";
-const GLYPH_UNLOCK: &str = "\u{E785}";
+
+#[derive(Clone, Copy)]
+enum Glyph {
+    Collapse,
+    Expand,
+    Lock,
+    Unlock,
+}
+
+/// 1 px 线图标（圆头），画在按钮矩形正中，12 px 见方；坐标落在半像素上线才清晰
+fn draw_glyph(a: &App, g: Glyph, r: &D2D_RECT_F, color: &D2D1_COLOR_F, dy: f32) {
+    unsafe {
+        let (rt, br) = (&a.gfx.dc, &a.gfx.brush);
+        br.SetColor(color);
+        let (cx, cy) = (((r.left + r.right) / 2.0).floor() + 0.5, ((r.top + r.bottom) / 2.0).floor() + 0.5 + dy);
+        let p = |x: f32, y: f32| Vector2 { X: cx + x, Y: cy + y };
+        let line = |a1: Vector2, b1: Vector2| rt.DrawLine(a1, b1, br, HAIR, &a.gfx.stroke);
+        match g {
+            Glyph::Collapse | Glyph::Expand => {
+                let d = if matches!(g, Glyph::Collapse) { 1.0 } else { -1.0 };
+                line(p(-4.0, 2.0 * d), p(0.0, -2.0 * d));
+                line(p(0.0, -2.0 * d), p(4.0, 2.0 * d));
+            }
+            Glyph::Lock | Glyph::Unlock => {
+                let body = D2D1_ROUNDED_RECT { rect: rect(cx - 5.0, cy - 1.0, cx + 5.0, cy + 5.0), radiusX: 1.5, radiusY: 1.5 };
+                rt.DrawRoundedRectangle(&body, br, HAIR, &a.gfx.stroke);
+                // 锁梁：左脚 → 半圆 → 右脚；打开时右脚抬起不落回锁身
+                let Ok(geo) = a.d2d.CreatePathGeometry() else { return };
+                let Ok(sink) = geo.Open() else { return };
+                sink.BeginFigure(p(-3.0, -1.0), D2D1_FIGURE_BEGIN_HOLLOW);
+                sink.AddLine(p(-3.0, -3.0));
+                let arc = D2D1_ARC_SEGMENT {
+                    point: p(3.0, -3.0),
+                    size: D2D_SIZE_F { width: 3.0, height: 3.0 },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                };
+                sink.AddArc(&arc);
+                if matches!(g, Glyph::Lock) {
+                    sink.AddLine(p(3.0, -1.0));
+                } else {
+                    sink.AddLine(p(3.0, -4.0));
+                }
+                sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                let _ = sink.Close();
+                rt.DrawGeometry(&geo, br, HAIR, &a.gfx.stroke);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Btn {
@@ -135,13 +185,19 @@ fn grid(w: f32) -> (usize, f32) {
     (n, inner / n as f32)
 }
 
-/// 标题栏：右上角两个按钮，名字在两侧各让出同样宽度后居中
+/// 标题栏：右上角两个按钮，折叠在最右、锁定在它左边，任何状态下都不换位置；名字在两侧各让出同样宽度后居中
 fn title_layout(w: f32) -> (D2D_RECT_F, D2D_RECT_F, (f32, f32)) {
     let top = (TITLE_H - BTN) / 2.0;
-    let lock = rect(w - BTN_PAD - BTN, top, w - BTN_PAD, top + BTN);
-    let roll = rect(lock.left - BTN, top, lock.left, top + BTN);
+    let roll = rect(w - BTN_PAD - BTN, top, w - BTN_PAD, top + BTN);
+    let lock = rect(roll.left - BTN, top, roll.left, top + BTN);
     let side = BTN_PAD + 2.0 * BTN;
     (roll, lock, (side, (w - side).max(side)))
+}
+
+/// 格子里文件名的位置：图标下方，左右各缩进 4，高两行
+fn label_rect(r: &D2D_RECT_F) -> D2D_RECT_F {
+    let top = r.top + CELL_PAD + ICON + GAP;
+    rect(r.left + 4.0, top, r.right - 4.0, top + LABEL_H)
 }
 
 impl Tile {
@@ -414,9 +470,9 @@ impl Tile {
             if let Some(edge) = &th.edge {
                 // 外圈淡白、内圈淡黑：深色、浅色壁纸上都看得出一圈不显眼的边
                 br.SetColor(edge);
-                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(0.5, 0.5, w - 0.5, h - 0.5), radiusX: 8.0, radiusY: 8.0 }, br, 1.0, None);
+                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(0.5, 0.5, w - 0.5, h - 0.5), radiusX: RADIUS_PANEL, radiusY: RADIUS_PANEL }, br, HAIR, None);
                 br.SetColor(&th.edge_in);
-                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(1.5, 1.5, w - 1.5, h - 1.5), radiusX: 7.0, radiusY: 7.0 }, br, 1.0, None);
+                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(1.5, 1.5, w - 1.5, h - 1.5), radiusX: RADIUS_PANEL - 1.0, radiusY: RADIUS_PANEL - 1.0 }, br, HAIR, None);
             }
 
             let (roll, lock, (nl, nr)) = title_layout(w);
@@ -427,18 +483,21 @@ impl Tile {
                 text(&l, nl, 0.0, &th.text);
             }
             for (btn, r, glyph, shown) in [
-                (Btn::Roll, roll, if self.rolled { GLYPH_EXPAND } else { GLYPH_COLLAPSE }, self.inside || self.rolled),
-                (Btn::Lock, lock, if self.locked { GLYPH_LOCK } else { GLYPH_UNLOCK }, self.inside || self.locked),
+                (Btn::Roll, roll, if self.rolled { Glyph::Expand } else { Glyph::Collapse }, self.inside || self.rolled),
+                (Btn::Lock, lock, if self.locked { Glyph::Lock } else { Glyph::Unlock }, self.inside || self.locked),
             ] {
                 if !shown {
                     continue;
                 }
                 if self.hot == btn {
                     br.SetColor(&th.hover);
-                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 4.0, radiusY: 4.0 }, br);
+                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RADIUS_CONTROL, radiusY: RADIUS_CONTROL }, br);
                 }
-                br.SetColor(if self.hot == btn { &th.text } else { &th.muted });
-                rt.DrawText(&u16s(glyph), &a.fmt_icon, &r, br, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+                // 壁纸上的图标和文字一样先描一层暗边
+                if th.shadow {
+                    draw_glyph(a, glyph, &r, &th.shade, 1.0);
+                }
+                draw_glyph(a, glyph, &r, if self.hot == btn { &th.text } else { &th.muted }, 0.0);
             }
 
             if !self.rolled {
@@ -449,7 +508,6 @@ impl Tile {
                 }
                 rt.PushAxisAlignedClip(&rect(0.0, TITLE_H, w, h), D2D1_ANTIALIAS_MODE_ALIASED);
                 let s = scale(self.hwnd);
-                let (_, cw) = grid(w);
                 for i in 0..self.items.len() {
                     let r = self.item_rect(i, w);
                     if r.bottom < TITLE_H || r.top > h {
@@ -460,7 +518,7 @@ impl Tile {
                         br.SetColor(&th.sel_fill);
                         rt.FillRoundedRectangle(&cell, br);
                         br.SetColor(&th.sel_line);
-                        rt.DrawRoundedRectangle(&cell, br, 1.0, None);
+                        rt.DrawRoundedRectangle(&cell, br, HAIR, None);
                     } else if self.hover == Some(i) {
                         br.SetColor(&th.hover);
                         rt.FillRoundedRectangle(&cell, br);
@@ -470,8 +528,11 @@ impl Tile {
                         rt.FillRoundedRectangle(&cell, br);
                     }
                     if self.kbd && self.focus == i {
-                        br.SetColor(&th.text);
-                        rt.DrawRoundedRectangle(&cell, br, 2.0, None);
+                        // 键盘焦点：1 px 强调色边框加 3 px 淡光环
+                        br.SetColor(&th.ring);
+                        rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(cell.rect.left - 1.0, cell.rect.top - 1.0, cell.rect.right + 1.0, cell.rect.bottom + 1.0), radiusX: RADIUS + 1.0, radiusY: RADIUS + 1.0 }, br, 3.0, None);
+                        br.SetColor(&th.accent);
+                        rt.DrawRoundedRectangle(&cell, br, HAIR, None);
                     }
                     let it = &mut self.items[i];
                     if let Some(bmp) = &it.icon {
@@ -479,16 +540,17 @@ impl Tile {
                         let px = bmp.GetPixelSize();
                         let (bw, bh) = (px.width as f32, px.height as f32);
                         let x = (((r.left + r.right) * s - bw) / 2.0).round();
-                        let y = ((r.top + PAD) * s + (ICON * s - bh) / 2.0).round();
+                        let y = ((r.top + CELL_PAD) * s + (ICON * s - bh) / 2.0).round();
                         let dst = rect(x / s, y / s, (x + bw) / s, (y + bh) / s);
                         rt.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None);
                     }
+                    let lr = label_rect(&r);
                     if it.layout.is_none() {
                         let t = u16s(&Self::display_name(a, it));
-                        it.layout = a.dw.CreateTextLayout(&t, &a.fmt_label, cw - 8.0, LABEL_H).ok();
+                        it.layout = a.dw.CreateTextLayout(&t, &a.fmt_label, lr.right - lr.left, LABEL_H).ok();
                     }
                     if let Some(l) = &it.layout {
-                        text(l, r.left + 4.0, r.top + PAD + ICON + GAP, &th.text);
+                        text(l, lr.left, lr.top, &th.text);
                     }
                 }
                 if let Some(k) = self.insert {
@@ -511,11 +573,11 @@ impl Tile {
                 }
             }
             if self.drop_hot {
-                let edge = D2D1_ROUNDED_RECT { rect: rect(1.0, 1.0, w - 1.0, h - 1.0), radiusX: 7.0, radiusY: 7.0 };
-                br.SetColor(&D2D1_COLOR_F { a: 0.12, ..th.sel_line });
+                let edge = D2D1_ROUNDED_RECT { rect: rect(1.0, 1.0, w - 1.0, h - 1.0), radiusX: RADIUS_PANEL - 1.0, radiusY: RADIUS_PANEL - 1.0 };
+                br.SetColor(&th.sel_fill);
                 rt.FillRoundedRectangle(&edge, br);
-                br.SetColor(&th.sel_line);
-                rt.DrawRoundedRectangle(&edge, br, 2.0, None);
+                br.SetColor(&th.accent);
+                rt.DrawRoundedRectangle(&edge, br, HAIR, None);
             }
             let ok = rt.EndDraw(None, None).is_ok();
             if !(a.gfx.present(&surf).is_ok() && ok) {
@@ -829,15 +891,17 @@ impl Tile {
         let s = scale(self.hwnd);
         let (r, text, font) = match item {
             Some(i) => {
-                let r = self.item_rect(i, w);
-                (rect(r.left, r.top + PAD + ICON + GAP - 4.0, r.right, r.top + PAD + ICON + GAP + 20.0), self.items[i].name.clone(), a.edit_font)
+                // 盖住整块文件名：同字体、同左右宽度，单行编辑框的字贴着框顶画，和文件名第一行基线重合
+                (label_rect(&self.item_rect(i, w)), self.items[i].name.clone(), a.edit_font)
             }
             None => {
+                // 盖在标题上：同字体、同左右范围、一样居中；框顶是标题字的上沿，框在标题栏里上下对称
                 let (_, _, (nl, nr)) = title_layout(w);
-                (rect(nl, (TITLE_H - 24.0) / 2.0, nr, (TITLE_H + 24.0) / 2.0), self.name.clone(), a.title_font)
+                (rect(nl, a.title_top, nr, TITLE_H - a.title_top), self.name.clone(), a.title_font)
             }
         };
-        let mut pt = POINT { x: (r.left * s) as i32, y: (r.top * s) as i32 };
+        // D2D 画字时基线对齐到整像素，框的位置也四舍五入，字才落在同一行
+        let mut pt = POINT { x: (r.left * s).round() as i32, y: (r.top * s).round() as i32 };
         unsafe {
             let _ = ClientToScreen(self.hwnd, &mut pt);
             let t = shell::wide(&text);

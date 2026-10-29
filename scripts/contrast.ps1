@@ -7,8 +7,8 @@ function Ratio($x, $y) { $l1 = Lum $x; $l2 = Lum $y; ([math]::Max($l1, $l2) + 0.
 function Hex([string]$h) { @(0, 2, 4 | ForEach-Object { [Convert]::ToInt32($h.Substring($_, 2), 16) / 255 }) }
 
 $themes = @(
-    @{ Name = '深色'; Tint = '202020'; TintA = 0.78; Behind = @('FFFFFF', '808080', '000000'); Text = 'F3F3F3'; Muted = 'F3F3F3'; MutedA = 0.74 },
-    @{ Name = '浅色'; Tint = 'F3F3F3'; TintA = 0.88; Behind = @('000000', '808080', 'FFFFFF'); Text = '1A1A1A'; Muted = '1A1A1A'; MutedA = 0.74 }
+    @{ Name = '深色'; Tint = '1C1D1B'; TintA = 0.9; Behind = @('FFFFFF', '808080', '000000'); Text = 'DCDAD3'; Muted = 'DCDAD3'; MutedA = 0.86 },
+    @{ Name = '浅色'; Tint = 'FAFAF8'; TintA = 0.9; Behind = @('000000', '808080', 'FFFFFF'); Text = '3F4650'; Muted = '3F4650'; MutedA = 0.86 }
 )
 foreach ($t in $themes) {
     foreach ($b in $t.Behind) {

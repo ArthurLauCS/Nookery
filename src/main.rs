@@ -7,11 +7,13 @@
 //! --uninstall 显示回桌面图标、删掉开机自启和右键菜单后退出（卸载程序调用）。
 
 mod drop;
+mod fonts;
 mod gfx;
 mod lang;
 mod rules;
 mod shell;
 mod tile;
+mod theme;
 mod toast;
 
 use std::collections::HashMap;
@@ -20,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -37,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
 use lang::tr;
+use theme::Theme;
 use rules::{Config, TileCfg};
 use tile::{CELL_H, Entry, PAD, TITLE_H, Tile};
 
@@ -54,29 +56,6 @@ const MENU_CMD_KEY: PCWSTR = w!("Software\\Classes\\DesktopBackground\\Shell\\No
 const T_SCAN: usize = 1;
 const OPACITY_LEVELS: [u8; 5] = [100, 75, 50, 25, 0];
 
-pub struct Theme {
-    pub dark: bool,
-    pub tint: D2D1_COLOR_F,
-    pub text: D2D1_COLOR_F,
-    pub muted: D2D1_COLOR_F,
-    pub hover: D2D1_COLOR_F,
-    pub press: D2D1_COLOR_F,
-    pub sel_fill: D2D1_COLOR_F,
-    pub sel_line: D2D1_COLOR_F,
-    /// 透明度 ≥50% 时开亚克力模糊（磨砂），25% 和 0% 不模糊
-    pub blur: bool,
-    /// 透明度 ≤50% 时文字压在壁纸上：白字加阴影，和桌面图标一致
-    pub shadow: bool,
-    pub shade: D2D1_COLOR_F,
-    /// 全透明时自己画的淡边框；Some 也表示关掉 DWM 的边框和阴影
-    pub edge: Option<D2D1_COLOR_F>,
-    pub edge_in: D2D1_COLOR_F,
-    /// 全透明时鼠标移进来显出的淡底色，方便看清磁贴范围
-    pub peek: D2D1_COLOR_F,
-    pub edit_bg: COLORREF,
-    pub edit_fg: COLORREF,
-}
-
 pub struct App {
     pub root: PathBuf,
     /// 所有用户共用的桌面；测试模式没有
@@ -88,18 +67,18 @@ pub struct App {
     main: HWND,
     pub owner: Option<HWND>,
     pub tiles: Vec<Box<Tile>>,
-    d2d: ID2D1Factory1,
+    pub d2d: ID2D1Factory1,
     pub gfx: gfx::Gfx,
     pub dw: IDWriteFactory,
     pub fmt_title: IDWriteTextFormat,
     pub fmt_label: IDWriteTextFormat,
     pub fmt_hint: IDWriteTextFormat,
-    /// 标题栏按钮的系统图标字体
-    pub fmt_icon: IDWriteTextFormat,
     pub fmt_toast: IDWriteTextFormat,
-    /// 改名框字体：文件名 12、磁贴名 14 半粗，和 D2D 里的字号一致
+    /// 改名框字体（GDI）：文件名用雅黑 UI，磁贴名用和 D2D 里同一个字体（朱雀仿宋；装不上退回雅黑 UI）
     pub edit_font: HFONT,
     pub title_font: HFONT,
+    /// 磁贴名这一行字的上沿（基线减上伸）：磁贴名改名框的框顶，单行编辑框的字贴着框顶画，和标题重合
+    pub title_top: f32,
     pub edit_brush: HBRUSH,
     pub theme: Theme,
     pub toast: Option<toast::Toast>,
@@ -126,10 +105,6 @@ static mut APP: *mut App = std::ptr::null_mut();
 /// 单线程 UI，全局状态只在主线程上访问
 pub fn app() -> &'static mut App {
     unsafe { &mut *APP }
-}
-
-fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r, g, b, a }
 }
 
 fn reg_dword(key: PCWSTR, name: PCWSTR) -> Option<u32> {
@@ -238,6 +213,21 @@ pub fn popup(hwnd: HWND, pt: POINT, items: &[(u32, &str)]) -> u32 {
     track(hwnd, pt, menu_from(items))
 }
 
+/// 系统画的菜单（磁贴菜单、托盘菜单、文件右键菜单）跟磁贴的深浅色走。用 uxtheme 没公开的序号导出（Win10 1903 起）：
+/// 135 SetPreferredAppMode（2 强制深色，3 强制浅色），136 FlushMenuThemes 让菜单重读主题
+fn menu_theme(dark: bool) {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    type SetMode = unsafe extern "system" fn(i32) -> i32;
+    type Flush = unsafe extern "system" fn();
+    unsafe {
+        let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        if let (Some(mode), Some(flush)) = (GetProcAddress(ux, PCSTR(135 as _)), GetProcAddress(ux, PCSTR(136 as _))) {
+            std::mem::transmute::<_, SetMode>(mode)(if dark { 2 } else { 3 });
+            std::mem::transmute::<_, Flush>(flush)();
+        }
+    }
+}
+
 fn track(hwnd: HWND, pt: POINT, menu: HMENU) -> u32 {
     unsafe {
         let _ = SetForegroundWindow(hwnd);
@@ -249,36 +239,11 @@ fn track(hwnd: HWND, pt: POINT, menu: HMENU) -> u32 {
 
 impl App {
     fn load_theme(&mut self) {
-        let dark = self.force_dark.unwrap_or_else(|| reg_dword(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), w!("AppsUseLightTheme")) != Some(1));
-        // AccentColor 是 0xAABBGGRR
-        let c = reg_dword(w!("Software\\Microsoft\\Windows\\DWM"), w!("AccentColor")).unwrap_or(0xFFD47800);
-        let (r, g, b) = ((c & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, ((c >> 16) & 0xFF) as f32 / 255.0);
-        // 透明度 ≤50% 时底色太薄，深色字在深色壁纸上看不清：不管系统主题，都改成桌面图标那样的白字加阴影
-        let o = self.cfg.opacity as f32 / 100.0;
-        let desk = o <= 0.5;
-        let dark = dark || desk;
-        // 底色和文字取值见 scripts/contrast.ps1：不透明度 100% 时，亚克力背后是纯白（深色）或纯黑（浅色），正文和次要文字仍 ≥4.5:1
-        let (bg, fg) = if dark { (0x20 as f32 / 255.0, 0xF3 as f32 / 255.0) } else { (0xF3 as f32 / 255.0, 0x1A as f32 / 255.0) };
-        let gdi = |v: f32| (v * 255.0) as u32;
-        let (ebg, efg) = if dark { (0x2B, gdi(fg)) } else { (0xFF, gdi(fg)) };
-        self.theme = Theme {
-            dark,
-            tint: rgba(bg, bg, bg, o * if dark { 0.78 } else { 0.88 }),
-            text: rgba(fg, fg, fg, 1.0),
-            muted: rgba(fg, fg, fg, if desk { 0.86 } else { 0.74 }),
-            hover: rgba(fg, fg, fg, 0.10),
-            press: rgba(fg, fg, fg, 0.18),
-            sel_fill: rgba(r, g, b, 0.32),
-            sel_line: rgba(r, g, b, 0.85),
-            blur: o >= 0.5,
-            shadow: desk,
-            shade: rgba(0.0, 0.0, 0.0, 0.5),
-            edge: (o == 0.0).then(|| rgba(1.0, 1.0, 1.0, 0.28)),
-            edge_in: rgba(0.0, 0.0, 0.0, 0.18),
-            peek: rgba(bg, bg, bg, 0.30),
-            edit_bg: COLORREF(ebg | ebg << 8 | ebg << 16),
-            edit_fg: COLORREF(efg | efg << 8 | efg << 16),
-        };
+        // 没有这个值时是系统默认的浅色
+        let system_dark = self.force_dark.unwrap_or_else(|| reg_dword(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), w!("AppsUseLightTheme")) == Some(0));
+        // 配色全在 theme.rs；透明度 ≤50% 时文字压在壁纸上，改用夜色那套加阴影（见 Theme::new）
+        self.theme = Theme::new(system_dark, self.cfg.opacity);
+        menu_theme(self.theme.dark);
         unsafe {
             if !self.edit_brush.is_invalid() {
                 let _ = DeleteObject(self.edit_brush.into());
@@ -866,29 +831,40 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     }
 }
 
-fn text_format(dw: &IDWriteFactory, family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> IDWriteTextFormat {
+fn text_format(dw: &IDWriteFactory, family: PCWSTR, coll: Option<&IDWriteFontCollection>, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> IDWriteTextFormat {
     unsafe {
-        let f = dw.CreateTextFormat(family, None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("zh-CN")).expect("创建字体失败");
+        let f = dw.CreateTextFormat(family, coll, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("zh-CN")).expect("创建字体失败");
         let _ = f.SetTextAlignment(align);
         let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         f
     }
 }
 
-/// Win11 的图标字体是 Segoe Fluent Icons，Win10 只有 Segoe MDL2 Assets，两者用到的码位相同
-fn icon_family(dw: &IDWriteFactory) -> PCWSTR {
+/// 字体的度量；字体不在 coll（或系统）里时取 Segoe UI 顶替
+fn font_metrics(dw: &IDWriteFactory, family: PCWSTR, coll: Option<&IDWriteFontCollection>, weight: DWRITE_FONT_WEIGHT) -> DWRITE_FONT_METRICS {
     unsafe {
-        let mut coll = None;
-        let _ = dw.GetSystemFontCollection(&mut coll, false);
-        let (mut idx, mut found) = (0u32, BOOL(0));
-        if let Some(c) = coll {
-            let _ = c.FindFamilyName(w!("Segoe Fluent Icons"), &mut idx, &mut found);
-        }
-        if found.as_bool() { w!("Segoe Fluent Icons") } else { w!("Segoe MDL2 Assets") }
+        let coll = match coll {
+            Some(c) => c.clone(),
+            None => {
+                let mut c = None;
+                let _ = dw.GetSystemFontCollection(&mut c, false);
+                c.expect("读取系统字体失败")
+            }
+        };
+        let find = |f: PCWSTR| {
+            let (mut idx, mut found) = (0u32, BOOL(0));
+            let _ = coll.FindFamilyName(f, &mut idx, &mut found);
+            found.as_bool().then_some(idx)
+        };
+        let idx = find(family).or_else(|| find(w!("Segoe UI"))).or(Some(0)).expect("找不到界面字体");
+        let font = coll.GetFontFamily(idx).and_then(|f| f.GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL)).expect("读取字体失败");
+        let mut m = DWRITE_FONT_METRICS::default();
+        font.GetMetrics(&mut m);
+        m
     }
 }
 
-fn gdi_font(size: f32, weight: i32) -> HFONT {
+fn gdi_font(face: PCWSTR, size: f32, weight: i32) -> HFONT {
     // 负数高度是字符高度（像素）：按系统 DPI 把 DIP 字号换算成像素，和 D2D 里同字号的字一样大
     unsafe {
         CreateFontW(
@@ -905,7 +881,7 @@ fn gdi_font(size: f32, weight: i32) -> HFONT {
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             0,
-            w!("Microsoft YaHei UI"),
+            face,
         )
     }
 }
@@ -1061,19 +1037,54 @@ fn main() {
         let d2d: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).expect("D2D 初始化失败");
         let gfx = gfx::Gfx::new(&d2d).expect("D3D 初始化失败");
         let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("DirectWrite 初始化失败");
-        let ui = w!("Segoe UI Variable Text");
-        let fmt_title = text_format(&dw, ui, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
+        let ui_name = shell::wide(theme::FONT_UI);
+        let ui = PCWSTR(ui_name.as_ptr());
+        let (w_title, w_body) = (DWRITE_FONT_WEIGHT(theme::WEIGHT_TITLE), DWRITE_FONT_WEIGHT(theme::WEIGHT_BODY));
+        // 磁贴名字体：随程序带的朱雀仿宋；文件缺失时退回界面字体，不报错
+        let display = fonts::load_display(&dw);
+        let disp_name = shell::wide(display.as_ref().map_or(theme::FONT_UI, |d| d.family.as_str()));
+        let disp = PCWSTR(disp_name.as_ptr());
+        let disp_coll = display.as_ref().map(|d| &d.collection);
+        let fmt_title = text_format(&dw, disp, disp_coll, theme::SIZE_TITLE, w_title, DWRITE_TEXT_ALIGNMENT_CENTER);
         let _ = fmt_title.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        if display.is_some() {
+            // 用户打的字朱雀仿宋里没有时，先回退微软雅黑 UI，再走系统回退链
+            if let (Ok(f1), Some(fb)) = (fmt_title.cast::<IDWriteTextFormat1>(), fonts::fallback(&dw, ui)) {
+                let _ = f1.SetFontFallback(&fb);
+            }
+        }
+        // 按行框居中时行框下部是降部，字形偏下：行高取标题栏高，基线放到让大写字母居中的位置，和按钮图标同一条中线
+        let m = font_metrics(&dw, disp, disp_coll, w_title);
+        let em = |v: u16| v as f32 * fmt_title.GetFontSize() / m.designUnitsPerEm as f32;
+        let baseline = (TITLE_H + em(m.capHeight)) / 2.0;
+        let _ = fmt_title.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, TITLE_H, baseline);
         ellipsis(&dw, &fmt_title);
-        let fmt_hint = text_format(&dw, ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
-        let fmt_icon = text_format(&dw, icon_family(&dw), 12.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
-        let fmt_toast = text_format(&dw, ui, 14.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
-        let fmt_label = text_format(&dw, ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
+        let fmt_hint = text_format(&dw, ui, None, theme::SIZE_LABEL, w_body, DWRITE_TEXT_ALIGNMENT_CENTER);
+        let fmt_toast = text_format(&dw, ui, None, theme::SIZE_TOAST, w_body, DWRITE_TEXT_ALIGNMENT_CENTER);
+        let fmt_label = text_format(&dw, ui, None, theme::SIZE_LABEL, w_body, DWRITE_TEXT_ALIGNMENT_CENTER);
         let _ = fmt_label.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         // 长英文单词没有断行点，普通 WRAP 会在第一行就截断，EMERGENCY_BREAK 允许在词中换行，两行都用上
         let _ = fmt_label.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
         ellipsis(&dw, &fmt_label);
-        let (edit_font, title_font) = (gdi_font(12.0, FW_NORMAL.0 as i32), gdi_font(14.0, FW_SEMIBOLD.0 as i32));
+        // 磁贴名改名框：同一字体的 GDI 版；装不上或 GDI 没认出就用雅黑 UI，不报错
+        let edit_font = gdi_font(ui, theme::SIZE_LABEL, FW_NORMAL.0 as i32);
+        let title_font = if display.is_some() && fonts::register_gdi(fonts::DISPLAY_FILE) {
+            let face = shell::wide(fonts::DISPLAY_GDI_FACE);
+            let f = gdi_font(PCWSTR(face.as_ptr()), theme::SIZE_TITLE, FW_NORMAL.0 as i32);
+            if fonts::gdi_face_is(f, fonts::DISPLAY_GDI_FACE) { f } else { gdi_font(ui, theme::SIZE_TITLE, FW_NORMAL.0 as i32) }
+        } else {
+            gdi_font(ui, theme::SIZE_TITLE, FW_NORMAL.0 as i32)
+        };
+        // 单行编辑框的字按 GDI 的上伸贴着框顶画：框顶 = 基线减 GDI 上伸，字才落在标题的基线上
+        let title_top = {
+            let dc = CreateCompatibleDC(None);
+            let old = SelectObject(dc, title_font.into());
+            let mut tm = TEXTMETRICW::default();
+            let _ = GetTextMetricsW(dc, &mut tm);
+            SelectObject(dc, old);
+            let _ = DeleteDC(dc);
+            baseline - tm.tmAscent as f32 * 96.0 / GetDpiForSystem() as f32
+        };
 
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
         let wc = WNDCLASSW { lpfnWndProc: Some(main_proc), lpszClassName: MAIN_CLASS, ..Default::default() };
@@ -1101,30 +1112,13 @@ fn main() {
             fmt_title,
             fmt_label,
             fmt_hint,
-            fmt_icon,
             fmt_toast,
             edit_font,
             title_font,
+            title_top,
             edit_brush: HBRUSH::default(),
             // 占位，马上由 load_theme 算出真正的值
-            theme: Theme {
-                dark: true,
-                tint: rgba(0.0, 0.0, 0.0, 0.0),
-                text: rgba(1.0, 1.0, 1.0, 1.0),
-                muted: rgba(1.0, 1.0, 1.0, 0.5),
-                hover: rgba(0.0, 0.0, 0.0, 0.0),
-                press: rgba(0.0, 0.0, 0.0, 0.0),
-                sel_fill: rgba(0.0, 0.0, 0.0, 0.0),
-                sel_line: rgba(0.0, 0.0, 0.0, 0.0),
-                blur: true,
-                shadow: false,
-                shade: rgba(0.0, 0.0, 0.0, 0.0),
-                edge: None,
-                edge_in: rgba(0.0, 0.0, 0.0, 0.0),
-                peek: rgba(0.0, 0.0, 0.0, 0.0),
-                edit_bg: COLORREF(0),
-                edit_fg: COLORREF(0),
-            },
+            theme: Theme::new(true, 100),
             toast: None,
             hide_ext: true,
             hidden: false,
