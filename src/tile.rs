@@ -19,7 +19,7 @@ use windows_numerics::Vector2;
 
 use crate::gfx::Surface;
 use crate::lang::tr;
-use crate::shell::{self, Items, Picked};
+use crate::shell::{self, IconJob, Items, Picked};
 use crate::theme::{HAIR, RADIUS_CONTROL, RADIUS_PANEL};
 use crate::{App, app, fit_work_area, popup};
 
@@ -127,8 +127,6 @@ pub struct Tile {
     pub locked: bool,
     pub items: Vec<Item>,
     surf: Option<Surface>,
-    pub painting: bool,
-    repaint: bool,
     scroll: f32,
     hover: Option<usize>,
     /// 鼠标在磁贴上：显示标题栏按钮；全透明时显出淡底色
@@ -210,8 +208,6 @@ impl Tile {
             locked,
             items: Vec::new(),
             surf: None,
-            painting: false,
-            repaint: false,
             scroll: 0.0,
             hover: None,
             inside: false,
@@ -413,31 +409,30 @@ impl Tile {
         }
     }
 
+    /// 后台取回的图标：项还在（名字和修改时间对得上）就建成位图重画，已换掉的项丢弃
+    pub fn set_icon(&mut self, a: &App, job: IconJob) {
+        if let Some(it) = self.items.iter_mut().find(|it| it.name == job.name && it.mtime == job.mtime) {
+            it.icon = job.pixels.as_ref().and_then(|p| shell::to_bitmap(&a.gfx.dc, p));
+            self.invalidate();
+        }
+    }
+
     fn paint(&mut self, a: &App) {
         unsafe {
             let _ = ValidateRect(Some(self.hwnd), None);
         }
-        // 取图标时 Shell 会抽消息，同一个磁贴的 WM_PAINT 可能重入：记下来，画完再补一次
-        if self.painting {
-            self.repaint = true;
-            return;
-        }
-        self.painting = true;
+        // 看得见的项第一次画时交给后台线程取图标，取回来由 set_icon 补上
         let (w, h) = self.size_dip();
-        let s = scale(self.hwnd);
+        let px = (ICON * scale(self.hwnd)) as i32;
         for i in 0..self.items.len() {
             let r = self.item_rect(i, w);
             let it = &mut self.items[i];
             if !it.icon_tried && r.bottom >= TITLE_H && r.top <= h {
                 it.icon_tried = true;
-                it.icon = shell::load_icon(&a.gfx.dc, &it.path, (ICON * s) as i32);
+                a.icons.load(IconJob { tile: self.hwnd.0 as usize, name: it.name.clone(), mtime: it.mtime, path: it.path.clone(), px, pixels: None });
             }
         }
         self.draw(a);
-        self.painting = false;
-        if std::mem::take(&mut self.repaint) {
-            self.invalidate();
-        }
     }
 
     fn draw(&mut self, a: &App) {

@@ -90,6 +90,8 @@ pub struct App {
     pub menu2: Option<IContextMenu2>,
     /// 拖进磁贴时显示系统拖拽缩略图
     pub drop_helper: Option<IDropTargetHelper>,
+    /// 后台取图标线程
+    pub icons: shell::Icons,
     /// 双击桌面监听线程
     dbl_thread: u32,
     taskbar_created: u32,
@@ -344,12 +346,7 @@ impl App {
                 }
             };
             let t = &mut self.tiles[idx];
-            if t.painting {
-                // 正在取图标时不换列表，稍后再刷
-                unsafe { SetTimer(Some(self.main), T_SCAN, 250, None) };
-            } else {
-                t.set_items(list);
-            }
+            t.set_items(list);
             unsafe {
                 shown |= IsWindowVisible(t.hwnd).as_bool() != visible;
                 let _ = ShowWindow(t.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
@@ -798,7 +795,18 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 if wp.0 == SPI_SETWORKAREA.0 as usize {
                     a.layout();
                 }
-                a.restyle();
+                // 开机时系统和各程序连着发很多次这个广播：深浅色真变了才换配色（换配色要重画、重取全部图标）
+                let dark = a.theme.dark;
+                a.load_theme();
+                if a.theme.dark != dark {
+                    a.restyle();
+                }
+            }
+            shell::WM_APP_ICON => {
+                let job = Box::from_raw(lp.0 as *mut shell::IconJob);
+                if let Some(t) = app().tiles.iter_mut().find(|t| t.hwnd.0 as usize == job.tile) {
+                    t.set_icon(a, *job);
+                }
             }
             WM_APP_NEWTILE => a.new_tile(Some(POINT { x: lp.0 as i32, y: (lp.0 >> 32) as i32 })),
             WM_DISPLAYCHANGE => a.layout(),
@@ -1125,6 +1133,7 @@ fn main() {
             topmost: args.iter().any(|a| a == "--top"),
             menu2: None,
             drop_helper: CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).ok(),
+            icons: shell::Icons::start(main),
             dbl_thread: 0,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             force_dark: if args.iter().any(|a| a == "--light") { Some(false) } else if args.iter().any(|a| a == "--dark") { Some(true) } else { None },
