@@ -69,13 +69,24 @@ fn desktop_listview() -> Option<HWND> {
     }
 }
 
-/// 资源管理器的桌面图标整体显示 / 隐藏，和桌面右键“查看 → 显示桌面图标”是同一个开关（资源管理器自己记住状态）
+/// “显示桌面图标”的设置是关的：资源管理器启动时按它建桌面，切换时写回
+fn icons_off() -> bool {
+    crate::reg_dword(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"), w!("HideIcons")) == Some(1)
+}
+
+/// 资源管理器的桌面建好了：图标列表在，并且已按设置显示出来（设置是关的就不会显示）
+pub fn desktop_ready() -> bool {
+    desktop_listview().is_some_and(|lv| unsafe { IsWindowVisible(lv) }.as_bool() || icons_off())
+}
+
+/// 资源管理器的桌面图标整体显示 / 隐藏，和桌面右键“查看 → 显示桌面图标”是同一个开关。
+/// 按设置判断要不要切换，不看列表窗口当下显没显示：登录时资源管理器正在按设置建桌面，窗口显隐还会变
 pub fn show_icons(show: bool) {
     // 桌面窗口里“显示桌面图标”菜单项的命令号，发一次切换一次
     const TOGGLE_ICONS: usize = 0x7402;
     let Some(lv) = desktop_listview() else { return };
     unsafe {
-        if IsWindowVisible(lv).as_bool() != show {
+        if icons_off() == show {
             if let Ok(def) = GetParent(lv) {
                 let _ = PostMessageW(Some(def), WM_COMMAND, WPARAM(TOGGLE_ICONS), LPARAM(0));
             }

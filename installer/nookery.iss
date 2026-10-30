@@ -58,14 +58,14 @@ Name: "{autoprograms}\Nookery"; Filename: "{app}\nookery.exe"
 Name: "{autodesktop}\Nookery"; Filename: "{app}\nookery.exe"; Tasks: desktopicon
 
 [Registry]
-; 和托盘菜单“开机自启”写的是同一个值，两边开关互认
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Nookery"; ValueData: """{app}\nookery.exe"""; Tasks: autostart
 ; 界面语言（zh / en），程序和右键菜单扩展都读这里，托盘菜单切换时改写
 Root: HKCU; Subkey: "Software\Nookery"; ValueType: string; ValueName: "Language"; ValueData: "{language}"; Flags: uninsdeletekey
 
 [Run]
 Filename: "{sys}\certutil.exe"; Parameters: "-f -addstore TrustedPeople ""{tmp}\nookery.cer"""; Verb: "runas"; Flags: shellexec runhidden waituntilterminated; Check: CertMissing; StatusMsg: "{cm:ContextMenu}"
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Add-AppxPackage -Path '{tmp}\nookery.msix' -ExternalLocation '{app}' -ForceUpdateFromAnyVersion"""; Flags: runhidden waituntilterminated; StatusMsg: "{cm:ContextMenu}"
+; 开机自启由程序自己建任务计划，和托盘菜单“开机自启”是同一个开关
+Filename: "{app}\nookery.exe"; Parameters: "--autostart"; Tasks: autostart; Flags: runhidden waituntilterminated
 Filename: "{app}\nookery.exe"; Description: "{cm:LaunchProgram,Nookery}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]

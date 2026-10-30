@@ -31,7 +31,9 @@ use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::Registry::*;
+use windows::Win32::System::TaskScheduler::*;
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -50,6 +52,8 @@ const WM_APP_NEWTILE: u32 = WM_APP + 4;
 /// 旧版把归进磁贴的文件放在桌面下的这个目录，启动时搬回桌面；--root 测试模式的配置也放这里
 const DATA_DIR: &str = ".Nookery";
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+/// 开机自启的任务计划名
+const TASK: &str = "Nookery";
 /// 桌面空白处右键菜单里的“新建磁贴”（Win11 下在“显示更多选项”里）
 const MENU_KEY: PCWSTR = w!("Software\\Classes\\DesktopBackground\\Shell\\NookeryNew");
 const MENU_CMD_KEY: PCWSTR = w!("Software\\Classes\\DesktopBackground\\Shell\\NookeryNew\\command");
@@ -631,23 +635,6 @@ impl App {
         }
     }
 
-    fn autostart(&self) -> bool {
-        unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Nookery"), RRF_RT_REG_SZ, None, None, None) == ERROR_SUCCESS }
-    }
-
-    fn set_autostart(&self, on: bool) {
-        unsafe {
-            if on {
-                let mut buf = [0u16; 1024];
-                let n = GetModuleFileNameW(None, &mut buf) as usize;
-                let cmd = shell::wide(&format!("\"{}\"", String::from_utf16_lossy(&buf[..n])));
-                let _ = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Nookery"), REG_SZ.0, Some(cmd.as_ptr() as _), (cmd.len() * 2) as u32);
-            } else {
-                let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Nookery"));
-            }
-        }
-    }
-
     /// 默认磁贴名换成当前语言（配置、窗口标题一起改）；用户改过名的、或新名字已被占用的不动。
     /// 托盘提示和桌面右键菜单的文字也跟着换
     fn relang(&mut self) {
@@ -686,7 +673,7 @@ impl App {
             let _ = GetCursorPos(&mut pt);
         }
         let check = |on: bool, s: &'static str| if on { format!("✓{s}") } else { s.to_string() };
-        let (auto, hidden) = (check(self.autostart(), tr("开机自启", "Start with Windows")), check(self.hidden, tr("隐藏磁贴", "Hide tiles")));
+        let (auto, hidden) = (check(autostart(), tr("开机自启", "Start with Windows")), check(self.hidden, tr("隐藏磁贴", "Hide tiles")));
         let dbl = check(self.cfg.dblclick, tr("双击桌面空白处隐藏磁贴", "Double-click desktop to hide tiles"));
         let items = [
             (1, tr("新建磁贴", "New tile")),
@@ -722,7 +709,7 @@ impl App {
                 self.restyle();
             }
             1 => self.new_tile(None),
-            4 =>self.set_autostart(!self.autostart()),
+            4 => set_autostart(!autostart()),
             5 => unsafe {
                 self.tray(NIM_DELETE);
                 let _ = DestroyWindow(self.main);
@@ -911,6 +898,50 @@ fn register_desktop_menu() {
     }
 }
 
+/// 开机自启是任务计划里当前用户“登录时”启动本程序的任务：注册表 Run 项由资源管理器在开机后逐个串行拉起，
+/// 排在后面要等一分多钟（2026-10-29 本机实测 82 秒），任务计划登录即启动
+fn task_folder() -> Option<ITaskFolder> {
+    unsafe {
+        let svc: ITaskService = CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER).ok()?;
+        let none = VARIANT::default();
+        svc.Connect(&none, &none, &none, &none).ok()?;
+        svc.GetFolder(&BSTR::from("\\")).ok()
+    }
+}
+
+fn autostart() -> bool {
+    task_folder().is_some_and(|f| unsafe { f.GetTask(&BSTR::from(TASK)) }.is_ok())
+}
+
+/// 旧版的开机自启写在 Run 项里，开关时一并删掉
+fn set_autostart(on: bool) {
+    unsafe {
+        let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Nookery"));
+        let Some(f) = task_folder() else { return };
+        if !on {
+            let _ = f.DeleteTask(&BSTR::from(TASK), 0);
+            return;
+        }
+        let mut buf = [0u16; 1024];
+        let n = GetModuleFileNameW(None, &mut buf) as usize;
+        let esc = |s: String| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let exe = esc(String::from_utf16_lossy(&buf[..n]));
+        let user = esc(format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default()));
+        // 触发限定为当前用户，普通用户才有权限建；默认设置会在任务跑满 3 天时结束程序、用电池时不启动、
+        // 以低于正常的优先级运行，都改掉
+        let xml = format!(
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\
+             <Triggers><LogonTrigger><UserId>{user}</UserId></LogonTrigger></Triggers>\
+             <Principals><Principal><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType></Principal></Principals>\
+             <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\
+             <ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>4</Priority></Settings>\
+             <Actions><Exec><Command>{exe}</Command></Exec></Actions></Task>"
+        );
+        let none = VARIANT::default();
+        let _ = f.RegisterTask(&BSTR::from(TASK), &BSTR::from(xml), TASK_CREATE_OR_UPDATE.0, &none, &none, TASK_LOGON_INTERACTIVE_TOKEN, &none);
+    }
+}
+
 /// 旧版把归进磁贴的文件移到 .Nookery\<磁贴名>\：搬回桌面，记下原来在哪块磁贴。
 /// 旧版指向此电脑、回收站等的快捷方式删掉，把原图标在“桌面图标设置”里打开，改由磁贴显示。
 /// 旧版配置里磁贴位置是像素坐标：按当时所在的显示器换算成比例
@@ -1008,8 +1039,16 @@ fn main() {
             migrate(&root, &mut Config::parse(""));
             shell::show_icons(true);
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, MENU_KEY);
-            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Nookery"));
         }
+        set_autostart(false);
+        return;
+    }
+    if args.iter().any(|a| a == "--autostart") {
+        // 安装程序勾了“开机自启”时调用
+        unsafe {
+            let _ = OleInitialize(None);
+        }
+        set_autostart(true);
         return;
     }
     unsafe {
@@ -1026,8 +1065,16 @@ fn main() {
             }
             return;
         }
+        // 开机自启在登录时就拉起本程序，资源管理器可能还没建好桌面：等它建好，才挂得上磁贴、关得掉桌面图标
+        while !shell::desktop_ready() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = OleInitialize(None);
+        // 旧版的开机自启写在 Run 项里：换成任务计划
+        if test_root.is_none() && RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Nookery"), RRF_RT_REG_SZ, None, None, None) == ERROR_SUCCESS {
+            set_autostart(true);
+        }
 
         let cfg_path = match &test_root {
             Some(_) => {
