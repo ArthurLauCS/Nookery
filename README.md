@@ -153,6 +153,7 @@ Command-line options:
 | `--top` | Keep tiles topmost, for screenshots |
 | `--light` / `--dark` | Force a theme |
 | `--new-tile` | New tile at the cursor; forwarded to the running instance if there is one |
+| `--autostart` | Turn on Start with Windows (a Task Scheduler task that runs at sign-in, so Nookery doesn't wait in the queue of startup apps), then exit (called by the installer) |
 | `--uninstall` | Turn the desktop icons back on, move files left by versions up to 0.2 back to the desktop, remove autostart and the context menu, then exit (called by the uninstaller after stopping the running instance) |
 
 ## License

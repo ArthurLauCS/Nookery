@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicU32};
+use std::time::SystemTime;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -20,6 +21,7 @@ use windows::core::*;
 
 pub const WM_APP_FS: u32 = WM_APP + 1;
 pub const WM_APP_DBLCLK: u32 = WM_APP + 3;
+pub const WM_APP_ICON: u32 = WM_APP + 5;
 
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -67,13 +69,24 @@ fn desktop_listview() -> Option<HWND> {
     }
 }
 
-/// 资源管理器的桌面图标整体显示 / 隐藏，和桌面右键“查看 → 显示桌面图标”是同一个开关（资源管理器自己记住状态）
+/// “显示桌面图标”的设置是关的：资源管理器启动时按它建桌面，切换时写回
+fn icons_off() -> bool {
+    crate::reg_dword(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"), w!("HideIcons")) == Some(1)
+}
+
+/// 资源管理器的桌面建好了：图标列表在，并且已按设置显示出来（设置是关的就不会显示）
+pub fn desktop_ready() -> bool {
+    desktop_listview().is_some_and(|lv| unsafe { IsWindowVisible(lv) }.as_bool() || icons_off())
+}
+
+/// 资源管理器的桌面图标整体显示 / 隐藏，和桌面右键“查看 → 显示桌面图标”是同一个开关。
+/// 按设置判断要不要切换，不看列表窗口当下显没显示：登录时资源管理器正在按设置建桌面，窗口显隐还会变
 pub fn show_icons(show: bool) {
     // 桌面窗口里“显示桌面图标”菜单项的命令号，发一次切换一次
     const TOGGLE_ICONS: usize = 0x7402;
     let Some(lv) = desktop_listview() else { return };
     unsafe {
-        if IsWindowVisible(lv).as_bool() != show {
+        if icons_off() == show {
             if let Ok(def) = GetParent(lv) {
                 let _ = PostMessageW(Some(def), WM_COMMAND, WPARAM(TOGGLE_ICONS), LPARAM(0));
             }
@@ -192,18 +205,63 @@ pub fn display_name(path: &Path) -> Option<String> {
     }
 }
 
-/// 系统图标或缩略图，转成 D2D 位图
-pub fn load_icon(rt: &ID2D1RenderTarget, path: &Path, px: i32) -> Option<ID2D1Bitmap> {
-    unsafe {
-        let p = wpath(path);
-        let f: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(p.as_ptr()), None).ok()?;
-        to_bitmap(rt, &f, px, SIIGBF_RESIZETOFIT)
+/// 取图标的请求，取到的像素填进 pixels 发回；磁贴窗口和（名字，修改时间）用来认回是哪一项
+pub struct IconJob {
+    pub tile: usize,
+    pub name: String,
+    pub mtime: SystemTime,
+    pub path: PathBuf,
+    pub px: i32,
+    pub pixels: Option<(Vec<u8>, u32, u32)>,
+}
+
+/// 后台取图标的线程。Shell 取一个图标要几到几十毫秒，开机冷缓存时慢得多，还会抽消息，放在界面线程上磁贴就无响应
+/// （磁贴以桌面为所有者，两边输入队列连着，桌面也跟着卡）。线程用 STA（实测比 MTA 快约 40%），所以自己抽消息；
+/// 请求走通道，线程消息只用来叫醒：被 Shell 的模态循环吃掉时，取完手上这个照样接着取
+pub struct Icons {
+    tx: std::sync::mpsc::Sender<IconJob>,
+    tid: u32,
+}
+
+impl Icons {
+    /// 取到的图标以 WM_APP_ICON 发给 notify，lparam 是 Box<IconJob>
+    pub fn start(notify: HWND) -> Icons {
+        let notify = notify.0 as usize;
+        let (tx, rx) = std::sync::mpsc::channel::<IconJob>();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let mut msg = MSG::default();
+            // 先建好消息队列再报线程 id，叫醒消息才不会丢
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+            let _ = tid_tx.send(windows::Win32::System::Threading::GetCurrentThreadId());
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                DispatchMessageW(&msg);
+                while let Ok(mut job) = rx.try_recv() {
+                    job.pixels = icon_pixels(&job.path, job.px);
+                    let p = Box::into_raw(Box::new(job));
+                    if PostMessageW(Some(HWND(notify as _)), WM_APP_ICON, WPARAM(0), LPARAM(p as isize)).is_err() {
+                        drop(Box::from_raw(p));
+                    }
+                }
+            }
+        });
+        Icons { tx, tid: tid_rx.recv().unwrap_or(0) }
+    }
+
+    pub fn load(&self, job: IconJob) {
+        let _ = self.tx.send(job);
+        unsafe {
+            let _ = PostThreadMessageW(self.tid, WM_NULL, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
-fn to_bitmap(rt: &ID2D1RenderTarget, f: &IShellItemImageFactory, px: i32, flags: SIIGBF) -> Option<ID2D1Bitmap> {
+/// 系统图标或缩略图的像素：BGRA、预乘 alpha、自上而下
+fn icon_pixels(path: &Path, px: i32) -> Option<(Vec<u8>, u32, u32)> {
     unsafe {
-        let hbm = f.GetImage(SIZE { cx: px, cy: px }, flags).ok()?;
+        let f: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(wpath(path).as_ptr()), None).ok()?;
+        let hbm = f.GetImage(SIZE { cx: px, cy: px }, SIIGBF_RESIZETOFIT).ok()?;
         let mut ds = DIBSECTION::default();
         let got = GetObjectW(hbm.into(), size_of::<DIBSECTION>() as i32, Some(&mut ds as *mut _ as _));
         let bm = ds.dsBm;
@@ -231,17 +289,21 @@ fn to_bitmap(rt: &ID2D1RenderTarget, f: &IShellItemImageFactory, px: i32, flags:
                     }
                 }
             }
-            let props = D2D1_BITMAP_PROPERTIES {
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-                dpiX: 96.0,
-                dpiY: 96.0,
-            };
-            rt.CreateBitmap(D2D_SIZE_U { width: w as u32, height: h as u32 }, Some(buf.as_ptr() as _), (w * 4) as u32, &props)
-                .ok()
+            Some((buf, w as u32, h as u32))
         };
         let _ = DeleteObject(hbm.into());
         result
     }
+}
+
+/// 取回的像素建成 D2D 位图；在界面线程调用（D2D 工厂是单线程的）
+pub fn to_bitmap(rt: &ID2D1RenderTarget, (buf, w, h): &(Vec<u8>, u32, u32)) -> Option<ID2D1Bitmap> {
+    let props = D2D1_BITMAP_PROPERTIES {
+        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+        dpiX: 96.0,
+        dpiY: 96.0,
+    };
+    unsafe { rt.CreateBitmap(D2D_SIZE_U { width: *w, height: *h }, Some(buf.as_ptr() as _), w * 4, &props).ok() }
 }
 
 /// 没有文件路径的系统项（控制面板里的某一项等）在 dir 里建一个指向它的快捷方式，重名时加序号；返回快捷方式的文件名
@@ -495,7 +557,7 @@ static DBL_X: AtomicI32 = AtomicI32::new(i32::MIN);
 static DBL_Y: AtomicI32 = AtomicI32::new(0);
 
 /// 全局鼠标钩子只看左键抬起，两次抬起落在系统双击时间和范围内就通知主窗口。
-/// 钩子单独开线程：主线程取图标时会卡上百毫秒，钩子跑在主线程会拖慢全系统的鼠标
+/// 钩子单独开线程：主线程复制文件、调 Shell 时会卡，钩子跑在主线程会拖慢全系统的鼠标
 unsafe extern "system" fn mouse_ll(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if code >= 0 && wp.0 as u32 == WM_LBUTTONUP {
